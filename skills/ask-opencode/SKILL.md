@@ -1,13 +1,11 @@
 ---
 name: ask-opencode
-description: "Sends a prompt to a GitHub Copilot model via opencode and presents the response inline, clearly attributed. Use this to get a second opinion or alternative perspective without leaving the Claude session."
+description: "Sends a prompt to an opencode model and presents the response inline, clearly attributed. Use this to get a second opinion or alternative perspective without leaving the Claude session."
 ---
 
 ## Available models
 
-Only use models from the `github-copilot` provider. Never use a model outside the `github-copilot/` namespace.
-
-Call the `list_models` tool from the `opencode` MCP server to get the current list at runtime.
+Call the `list_models` tool from the `opencode` MCP server to get the current list of allowed models at runtime.
 
 ## Step 1 — Resolve the prompt and model
 
@@ -15,7 +13,7 @@ If the user invoked the skill with an argument (e.g. `/ask-opencode <question>`)
 
 If no argument was given, ask the user what they would like to send to opencode before proceeding.
 
-If the user specifies a model (e.g. `/ask-opencode --model github-copilot/gpt-4o <question>`), use that model. Otherwise default to `github-copilot/gpt-4.1`.
+If the user specifies a model (e.g. `/ask-opencode --model github-copilot/gpt-4o <question>`), use that model. Otherwise use the MCP server's default (call `list_models` if unsure what's available).
 
 ## Step 2 — Send the prompt
 

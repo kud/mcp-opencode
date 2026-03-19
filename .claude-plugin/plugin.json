@@ -2,7 +2,7 @@
   "id": "mcp-opencode",
   "name": "opencode",
   "displayName": "opencode",
-  "description": "Query GitHub Copilot models (gpt-4.1, gpt-4o, o3, o4-mini) from inside Claude — get a second opinion without leaving your session.",
+  "description": "Query any opencode-supported model from inside Claude — get a second opinion without leaving your session. Defaults to GitHub Copilot models; configurable via OPENCODE_MODEL_ALLOW.",
   "version": "1.0.0",
   "author": "kud",
   "repository": "https://github.com/kud/mcp-opencode",
