@@ -1,0 +1,10 @@
+{
+  "mcp-opencode": {
+    "command": "npx",
+    "args": ["-y", "@kud/mcp-opencode@latest"],
+    "env": {
+      "OPENCODE_MODEL_ALLOW": "${OPENCODE_MODEL_ALLOW:-github-copilot/*}",
+      "OPENCODE_MODEL_BLOCK": "${OPENCODE_MODEL_BLOCK:-}"
+    }
+  }
+}

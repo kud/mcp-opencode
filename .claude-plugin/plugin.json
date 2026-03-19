@@ -1,32 +1,12 @@
 {
-  "id": "mcp-opencode",
-  "name": "opencode",
-  "displayName": "opencode",
+  "name": "mcp-opencode",
   "description": "Query any opencode-supported model from inside Claude — get a second opinion without leaving your session. Defaults to GitHub Copilot models; configurable via OPENCODE_MODEL_ALLOW.",
   "version": "1.0.0",
-  "author": "kud",
-  "repository": "https://github.com/kud/mcp-opencode",
-  "npm": "@kud/mcp-opencode",
-  "mcpConfig": {
-    "transport": "stdio",
-    "command": "npx",
-    "args": ["-y", "@kud/mcp-opencode@latest"],
-    "env": {
-      "OPENCODE_MODEL_ALLOW": "${OPENCODE_MODEL_ALLOW:-github-copilot/*}",
-      "OPENCODE_MODEL_BLOCK": "${OPENCODE_MODEL_BLOCK:-}"
-    }
+  "author": {
+    "name": "kud",
+    "url": "https://github.com/kud"
   },
-  "requiredEnv": [
-    {
-      "name": "OPENCODE_MODEL_ALLOW",
-      "description": "Comma-separated list of allowed model patterns (e.g. github-copilot/*). Defaults to github-copilot/* if unset.",
-      "required": false
-    },
-    {
-      "name": "OPENCODE_MODEL_BLOCK",
-      "description": "Comma-separated list of blocked model patterns. Optional.",
-      "required": false
-    }
-  ],
-  "skills": ["ask-opencode"]
+  "homepage": "https://github.com/kud/mcp-opencode",
+  "repository": "https://github.com/kud/mcp-opencode",
+  "license": "MIT"
 }
