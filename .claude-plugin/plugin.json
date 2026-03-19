@@ -16,5 +16,17 @@
       "OPENCODE_MODEL_BLOCK": "${OPENCODE_MODEL_BLOCK:-}"
     }
   },
+  "requiredEnv": [
+    {
+      "name": "OPENCODE_MODEL_ALLOW",
+      "description": "Comma-separated list of allowed model patterns (e.g. github-copilot/*). Defaults to github-copilot/* if unset.",
+      "required": false
+    },
+    {
+      "name": "OPENCODE_MODEL_BLOCK",
+      "description": "Comma-separated list of blocked model patterns. Optional.",
+      "required": false
+    }
+  ],
   "skills": ["ask-opencode"]
 }
