@@ -1,6 +1,8 @@
 {
-  "mcp-opencode": {
-    "command": "npx",
-    "args": ["tsx", "src/index.ts"]
+  "mcpServers": {
+    "mcp-opencode": {
+      "command": "npx",
+      "args": ["tsx", "src/index.ts"]
+    }
   }
 }
