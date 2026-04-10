@@ -14,8 +14,8 @@ const parsePatterns = (env: string | undefined) =>
     .map((s) => s.trim())
     .filter(Boolean)
 
-const ALLOW_PATTERNS = parsePatterns(process.env.OPENCODE_MODEL_ALLOW)
-const BLOCK_PATTERNS = parsePatterns(process.env.OPENCODE_MODEL_BLOCK)
+const ALLOW_PATTERNS = parsePatterns(process.env.MCP_OPENCODE_MODEL_ALLOW)
+const BLOCK_PATTERNS = parsePatterns(process.env.MCP_OPENCODE_MODEL_BLOCK)
 
 const matchesPattern = (model: string, pattern: string) =>
   pattern.endsWith("/*")
