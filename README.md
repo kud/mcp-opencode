@@ -29,7 +29,7 @@
 - 🔍 **Discover models** — list all models your opencode is configured for, optionally filtered by provider
 - 🚀 **Zero config auth** — no API tokens; delegates authentication entirely to opencode
 - ⚡ **Auto-start** — spins up the opencode server automatically if it isn't running
-- 🛡️ **Allow/block filters** — restrict which models are accessible via `OPENCODE_MODEL_ALLOW` / `OPENCODE_MODEL_BLOCK`
+- 🛡️ **Allow/block filters** — restrict which models are accessible via `MCP_OPENCODE_MODEL_ALLOW` / `MCP_OPENCODE_MODEL_BLOCK`
 - 🔌 **Works with any opencode provider** — anthropic, github-copilot, google-vertex, and any others you've configured
 
 ---
@@ -201,12 +201,12 @@ Edit `.vscode/mcp.json` in your workspace:
 
 Restrict which models are accessible using environment variables:
 
-| Variable               | Description                                                 | Example                        |
-| ---------------------- | ----------------------------------------------------------- | ------------------------------ |
-| `OPENCODE_MODEL_ALLOW` | Comma-separated allowlist (supports `provider/*` wildcards) | `github-copilot/*,anthropic/*` |
-| `OPENCODE_MODEL_BLOCK` | Comma-separated blocklist                                   | `anthropic/claude-opus-4-6`    |
+| Variable                   | Description                                                 | Example                        |
+| -------------------------- | ----------------------------------------------------------- | ------------------------------ |
+| `MCP_OPENCODE_MODEL_ALLOW` | Comma-separated allowlist (supports `provider/*` wildcards) | `github-copilot/*,anthropic/*` |
+| `MCP_OPENCODE_MODEL_BLOCK` | Comma-separated blocklist                                   | `anthropic/claude-opus-4-6`    |
 
-Both exact model IDs (`anthropic/claude-sonnet-4-6`) and provider wildcards (`github-copilot/*`) are supported. If `OPENCODE_MODEL_ALLOW` is unset, all models are allowed.
+Both exact model IDs (`anthropic/claude-sonnet-4-6`) and provider wildcards (`github-copilot/*`) are supported. If `MCP_OPENCODE_MODEL_ALLOW` is unset, all models are allowed.
 
 Example config with filtering:
 
@@ -217,8 +217,8 @@ Example config with filtering:
       "command": "npx",
       "args": ["-y", "@kud/mcp-opencode"],
       "env": {
-        "OPENCODE_MODEL_ALLOW": "github-copilot/*,anthropic/*",
-        "OPENCODE_MODEL_BLOCK": "anthropic/claude-opus-4-6"
+        "MCP_OPENCODE_MODEL_ALLOW": "github-copilot/*,anthropic/*",
+        "MCP_OPENCODE_MODEL_BLOCK": "anthropic/claude-opus-4-6"
       }
     }
   }
@@ -354,7 +354,7 @@ npm run inspect
 
 - No credentials are stored in or passed through this MCP server
 - All authentication is delegated to opencode's own config
-- Use `OPENCODE_MODEL_ALLOW` to restrict access to specific providers if needed
+- Use `MCP_OPENCODE_MODEL_ALLOW` to restrict access to specific providers if needed
 - Never commit `.mcp.json` or `.claude/` (both are gitignored)
 
 ---
