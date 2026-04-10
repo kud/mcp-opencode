@@ -1,7 +1,7 @@
 {
   "mcp-opencode": {
-    "command": "npx",
-    "args": ["-y", "@kud/mcp-opencode@latest"],
+    "command": "node",
+    "args": ["./dist/index.js"],
     "env": {
       "OPENCODE_MODEL_ALLOW": "${MCP_OPENCODE_MODEL_ALLOW:-github-copilot/*}",
       "OPENCODE_MODEL_BLOCK": "${MCP_OPENCODE_MODEL_BLOCK:-}"
