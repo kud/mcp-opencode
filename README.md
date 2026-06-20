@@ -1,33 +1,36 @@
-```
-███╗   ███╗ ██████╗██████╗      ██████╗ ██████╗ ███████╗███╗   ██╗ ██████╗ ██████╗ ██████╗ ███████╗
-████╗ ████║██╔════╝██╔══██╗    ██╔═══██╗██╔══██╗██╔════╝████╗  ██║██╔════╝██╔═══██╗██╔══██╗██╔════╝
-██╔████╔██║██║     ██████╔╝    ██║   ██║██████╔╝█████╗  ██╔██╗ ██║██║     ██║   ██║██║  ██║█████╗
-██║╚██╔╝██║██║     ██╔═══╝     ██║   ██║██╔═══╝ ██╔══╝  ██║╚██╗██║██║     ██║   ██║██║  ██║██╔══╝
-██║ ╚═╝ ██║╚██████╗██║         ╚██████╔╝██║     ███████╗██║ ╚████║╚██████╗╚██████╔╝██████╔╝███████╗
-╚═╝     ╚═╝ ╚═════╝╚═╝          ╚═════╝ ╚═╝     ╚══════╝╚═╝  ╚═══╝ ╚═════╝ ╚═════╝ ╚═════╝ ╚══════╝
-```
-
 <div align="center">
 
-[![TypeScript](https://img.shields.io/badge/TypeScript-5.x-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
-[![Node.js](https://img.shields.io/badge/Node.js-%3E%3D20-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
-[![MCP](https://img.shields.io/badge/MCP-1.0-blueviolet)](https://modelcontextprotocol.io/)
-[![npm](https://img.shields.io/npm/v/@kud/mcp-opencode?color=CB3837&logo=npm)](https://www.npmjs.com/package/@kud/mcp-opencode)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+![TypeScript](https://img.shields.io/badge/TypeScript-3178C6?style=flat-square&logo=typescript&logoColor=white)
+![Node.js](https://img.shields.io/badge/Node.js-339933?style=flat-square&logo=node.js&logoColor=white)
+![npm](https://img.shields.io/npm/v/@kud/mcp-opencode?style=flat-square&color=CB3837)
+![MIT](https://img.shields.io/badge/licence-MIT-22C55E?style=flat-square)
 
-**Query any opencode model from your AI assistant — no API key required.**
+**MCP server for opencode — query github-copilot models via a persistent opencode server.**
+
+<a href="https://kud.io/projects/mcp-opencode">Website</a> · <a href="https://kud.io/projects/mcp-opencode/docs">Documentation</a>
 
 </div>
 
----
+## Features
+
+- **Zero API key** — routes prompts through a locally running opencode server, so no provider credentials are needed in your AI client.
+- **Multi-model support** — any model configured in opencode is available; query GPT-4.1, Claude, Gemini, or any other supported provider.
+- **Model filtering** — restrict or block models via `MCP_OPENCODE_MODEL_ALLOW` and `MCP_OPENCODE_MODEL_BLOCK` environment variables using glob-style patterns.
+- **Auto-start** — if opencode is not already listening on port 4096, the server spawns it automatically in the background.
+- **Session isolation** — each `query` call creates and destroys a dedicated opencode session, preventing state leakage between calls.
+- **Works everywhere** — compatible with Claude Desktop, Claude Code, Cursor, Windsurf, VSCode, and any MCP-capable client.
 
 ## Install
 
-```bash
+```sh
 npm install -g @kud/mcp-opencode
 ```
 
-Register it with your AI client (Claude Desktop, Cursor, Windsurf, VSCode, Claude Code):
+Requires [opencode](https://opencode.ai) installed with at least one provider configured, and Node.js ≥ 20.
+
+## Usage
+
+Add the server to your MCP client configuration:
 
 ```json
 {
@@ -40,13 +43,33 @@ Register it with your AI client (Claude Desktop, Cursor, Windsurf, VSCode, Claud
 }
 ```
 
-Requires [opencode](https://opencode.ai) installed with at least one provider configured, and Node.js ≥ 20.
+To restrict which models are available, pass environment variables:
 
----
+```json
+{
+  "mcpServers": {
+    "opencode": {
+      "command": "npx",
+      "args": ["-y", "@kud/mcp-opencode"],
+      "env": {
+        "MCP_OPENCODE_MODEL_ALLOW": "github-copilot/*",
+        "MCP_OPENCODE_MODEL_BLOCK": "github-copilot/gpt-4o-mini"
+      }
+    }
+  }
+}
+```
+
+### Available tools
+
+| Tool          | Description                                                                                                                |
+| ------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| `query`       | Send a prompt to an opencode model. Accepts `prompt` (required) and `model` (optional, default: `github-copilot/gpt-4.1`). |
+| `list_models` | List models available through the running opencode server. Accepts an optional `provider` filter (e.g. `anthropic`).       |
 
 ## Development
 
-```bash
+```sh
 git clone https://github.com/kud/mcp-opencode.git
 cd mcp-opencode
 npm install
@@ -54,8 +77,13 @@ npm run build
 npm test
 ```
 
-Use the local `.mcp.json` to connect Claude Code to your dev build, or `npm run inspect` to open the MCP Inspector.
+Use the local `.mcp.json` to connect Claude Code to your dev build, or `npm run inspect` to open the MCP Inspector against the compiled output.
 
----
+| Script            | Purpose                                     |
+| ----------------- | ------------------------------------------- |
+| `npm run dev`     | Run from source via `tsx`                   |
+| `npm run build`   | Compile TypeScript to `dist/`               |
+| `npm test`        | Run the Vitest test suite                   |
+| `npm run inspect` | Open MCP Inspector against the built server |
 
-📚 **Full documentation → https://kud.io/projects/mcp-opencode/docs**
+📚 **Full documentation → [mcp-opencode/docs](https://kud.io/projects/mcp-opencode/docs)**
