@@ -1,25 +1,25 @@
-import { describe, it, expect, vi, beforeEach } from "vitest"
+import { describe, it, expect, vi, beforeEach } from "vitest";
 
 vi.hoisted(() => {
-  process.env.OPENCODE_MODEL_ALLOW = "github-copilot/*"
-  process.env.OPENCODE_MODEL_BLOCK = ""
-})
+  process.env.MCP_OPENCODE_MODEL_ALLOW = "github-copilot/*";
+  process.env.MCP_OPENCODE_MODEL_BLOCK = "";
+});
 
 vi.mock("child_process", () => ({
   execSync: vi.fn(),
   spawn: vi.fn(() => ({ unref: vi.fn() })),
-}))
+}));
 
 vi.mock("@opencode-ai/sdk/client", () => ({
   createOpencodeClient: vi.fn(),
-}))
+}));
 
-import { execSync } from "child_process"
-import { createOpencodeClient } from "@opencode-ai/sdk/client"
-import { query, listModels, isModelAllowed } from "../index.js"
+import { execSync } from "child_process";
+import { createOpencodeClient } from "@opencode-ai/sdk/client";
+import { query, listModels, isModelAllowed } from "../index.js";
 
-const mockExecSync = vi.mocked(execSync)
-const mockCreateClient = vi.mocked(createOpencodeClient)
+const mockExecSync = vi.mocked(execSync);
+const mockCreateClient = vi.mocked(createOpencodeClient);
 
 const makeClient = () =>
   ({
@@ -44,88 +44,91 @@ const makeClient = () =>
         },
       }),
     },
-  }) as unknown as ReturnType<typeof createOpencodeClient>
+  }) as unknown as ReturnType<typeof createOpencodeClient>;
 
 beforeEach(() => {
-  vi.clearAllMocks()
-  mockExecSync.mockImplementation(() => Buffer.from(""))
-  mockCreateClient.mockReturnValue(makeClient())
-})
+  vi.clearAllMocks();
+  mockExecSync.mockImplementation(() => Buffer.from(""));
+  mockCreateClient.mockReturnValue(makeClient());
+});
 
 describe("isModelAllowed", () => {
   it("allows matching wildcard pattern", () => {
-    expect(isModelAllowed("github-copilot/gpt-4.1")).toBe(true)
-  })
+    expect(isModelAllowed("github-copilot/gpt-4.1")).toBe(true);
+  });
 
   it("rejects model not in allow list", () => {
-    expect(isModelAllowed("anthropic/claude-3")).toBe(false)
-  })
-})
+    expect(isModelAllowed("anthropic/claude-3")).toBe(false);
+  });
+});
 
 describe("query", () => {
   it("returns response on success", async () => {
-    const result = await query({ prompt: "hello" })
-    expect(result.content[0].text).toBe("Hello!")
-  })
+    const result = await query({ prompt: "hello" });
+    expect(result.content[0].text).toBe("Hello!");
+  });
 
   it("uses default model when none specified", async () => {
-    const client = makeClient()
-    mockCreateClient.mockReturnValue(client)
+    const client = makeClient();
+    mockCreateClient.mockReturnValue(client);
 
-    await query({ prompt: "hello" })
+    await query({ prompt: "hello" });
 
     expect(
       (client.session.prompt as ReturnType<typeof vi.fn>).mock.calls[0][0].body
         .model,
-    ).toEqual({ providerID: "github-copilot", modelID: "gpt-4.1" })
-  })
+    ).toEqual({ providerID: "github-copilot", modelID: "gpt-4.1" });
+  });
 
   it("rejects disallowed model", async () => {
-    const result = await query({ prompt: "hello", model: "anthropic/claude-3" })
-    expect(result.content[0].text).toContain("Error:")
-    expect(result.content[0].text).toContain("list_models")
-  })
+    const result = await query({
+      prompt: "hello",
+      model: "anthropic/claude-3",
+    });
+    expect(result.content[0].text).toContain("Error:");
+    expect(result.content[0].text).toContain("list_models");
+  });
 
   it("returns error when session creation fails", async () => {
-    const client = makeClient()
-    ;(client.session.create as ReturnType<typeof vi.fn>).mockResolvedValue({
+    const client = makeClient();
+    (client.session.create as ReturnType<typeof vi.fn>).mockResolvedValue({
       data: null,
-    })
-    mockCreateClient.mockReturnValue(client)
+    });
+    mockCreateClient.mockReturnValue(client);
 
-    const result = await query({ prompt: "hello" })
-    expect(result.content[0].text).toContain("Error:")
-  })
+    const result = await query({ prompt: "hello" });
+    expect(result.content[0].text).toContain("Error:");
+  });
 
   it("returns error when prompt throws", async () => {
-    const client = makeClient()
-    ;(client.session.prompt as ReturnType<typeof vi.fn>).mockRejectedValue(
+    const client = makeClient();
+    (client.session.prompt as ReturnType<typeof vi.fn>).mockRejectedValue(
       new Error("network error"),
-    )
-    mockCreateClient.mockReturnValue(client)
+    );
+    mockCreateClient.mockReturnValue(client);
 
-    const result = await query({ prompt: "hello" })
-    expect(result.content[0].text).toContain("Error:")
-  })
-})
+    const result = await query({ prompt: "hello" });
+    expect(result.content[0].text).toContain("Error:");
+  });
+});
 
 describe("listModels", () => {
   it("returns only allowed models", async () => {
-    const result = await listModels()
-    expect(result.content[0].text).toContain("github-copilot/gpt-4.1")
-    expect(result.content[0].text).toContain("github-copilot/gpt-5")
-    expect(result.content[0].text).not.toContain("anthropic/")
-    expect(result.content[0].text).not.toContain("openrouter/")
-  })
+    const result = await listModels();
+    expect(result.content[0].text).toContain("github-copilot/gpt-4.1");
+    expect(result.content[0].text).toContain("github-copilot/gpt-5");
+    expect(result.content[0].text).not.toContain("anthropic/");
+    expect(result.content[0].text).not.toContain("openrouter/");
+  });
 
   it("returns error when provider list throws", async () => {
-    const client = makeClient()
-    ;(client.config.providers as ReturnType<typeof vi.fn>).mockRejectedValue(
+    const client = makeClient();
+    (client.config.providers as ReturnType<typeof vi.fn>).mockRejectedValue(
       new Error("server unreachable"),
-    )
-    mockCreateClient.mockReturnValue(client)
+    );
+    mockCreateClient.mockReturnValue(client);
 
-    const result = await listModels()
-    expect(result.content[0].text).toContain("Error:")
-  })
-})
+    const result = await listModels();
+    expect(result.content[0].text).toContain("Error:");
+  });
+});
