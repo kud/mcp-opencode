@@ -4,6 +4,21 @@ All notable changes to this project are documented here.
 
 ---
 
+## 1.5.0 — 2026-09-28
+
+### Highlights
+
+- `send` now takes an optional `model` (provider/model) to use a different model for that one message, checked against the same `MCP_OPENCODE_MODEL_ALLOW`/`BLOCK` filters as `query`; leave it out and the session keeps using its own model as before. ([9deeb9d](https://github.com/kud/mcp-opencode/commit/9deeb9d75279eef8a7cff24db3fe7747b34780fb))
+
+<details>
+<summary>Internal (1 commit)</summary>
+
+- Fixed test isolation so a caller's `MCP_OPENCODE_MODEL` no longer leaks into the test suite.
+
+</details>
+
+---
+
 ## 1.4.0 — 2026-09-28
 
 ### Highlights
