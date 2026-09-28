@@ -4,6 +4,14 @@ All notable changes to this project are documented here.
 
 ---
 
+## 1.4.0 — 2026-09-28
+
+### Highlights
+
+- The model `query` uses is now configurable via `MCP_OPENCODE_MODEL`, instead of being fixed to `github-copilot/gpt-4.1`; the default is unchanged when the variable is unset. Documented in the README's configuration table. ([fedb97e](https://github.com/kud/mcp-opencode/commit/fedb97eaee2836e8f96aa2b493842167597006a9))
+
+---
+
 ## 1.3.0 — 2026-09-28
 
 ### Highlights
