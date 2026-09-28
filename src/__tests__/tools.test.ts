@@ -3,6 +3,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest"
 vi.hoisted(() => {
   process.env.MCP_OPENCODE_MODEL_ALLOW = "github-copilot/*"
   process.env.MCP_OPENCODE_MODEL_BLOCK = ""
+  delete process.env.MCP_OPENCODE_MODEL
 })
 
 vi.mock("child_process", () => ({
@@ -379,6 +380,36 @@ describe("send", () => {
       (client.session.prompt as ReturnType<typeof vi.fn>).mock.calls[0][0].body
         .agent,
     ).toBe("plan")
+  })
+
+  it("passes an allowed model through as providerID/modelID", async () => {
+    const client = makeClientWithSession()
+    mockCreateClient.mockReturnValue(client)
+
+    await send({
+      session_id: "session-1",
+      prompt: "hi",
+      model: "github-copilot/gpt-5.4",
+    })
+
+    expect(
+      (client.session.prompt as ReturnType<typeof vi.fn>).mock.calls[0][0].body
+        .model,
+    ).toEqual({ providerID: "github-copilot", modelID: "gpt-5.4" })
+  })
+
+  it("rejects a model outside the allowlist without prompting", async () => {
+    const client = makeClientWithSession()
+    mockCreateClient.mockReturnValue(client)
+
+    const result = await send({
+      session_id: "session-1",
+      prompt: "hi",
+      model: "anthropic/claude-opus-5-5",
+    })
+
+    expect(result.content[0].text).toContain("is not allowed")
+    expect(client.session.prompt).not.toHaveBeenCalled()
   })
 
   it("returns a still-running message when the timeout elapses", async () => {

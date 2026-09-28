@@ -11,8 +11,7 @@ const SERVER = new URL(OPENCODE_SERVER_URL)
 const SERVER_PORT = SERVER.port || "4096"
 const DEFAULT_SEND_TIMEOUT_SECONDS =
   Number(process.env.MCP_OPENCODE_SEND_TIMEOUT) || 600
-const DEFAULT_MODEL =
-  process.env.MCP_OPENCODE_MODEL || "github-copilot/gpt-4.1"
+const DEFAULT_MODEL = process.env.MCP_OPENCODE_MODEL || "github-copilot/gpt-4.1"
 
 const parsePatterns = (env: string | undefined) =>
   (env ?? "")
@@ -326,22 +325,31 @@ export const send = async ({
   session_id,
   prompt,
   agent,
+  model,
   port,
   timeout_seconds = DEFAULT_SEND_TIMEOUT_SECONDS,
 }: {
   session_id: string
   prompt: string
   agent?: string
+  model?: string
   port?: number
   timeout_seconds?: number
 }) => {
+  if (model && !isModelAllowed(model))
+    return textResult(
+      `Error: model "${model}" is not allowed. Use list_models to see available models.`,
+    )
+
   try {
     const { server, otherPorts } = await resolveSessionServer(session_id, port)
+    const [providerID, modelID] = (model?.split("/") ?? []) as [string, string]
     const reply = getClient(server.url).session.prompt({
       path: { id: session_id },
       body: {
         parts: [{ type: "text", text: prompt }],
         ...(agent && { agent }),
+        ...(model && { model: { providerID, modelID } }),
       },
     })
 
@@ -462,7 +470,7 @@ server.registerTool(
 server.registerTool(
   "send",
   {
-    description: `Send a message to an existing opencode session and return its reply. The session keeps its history and model, and the exchange appears live in any attached opencode TUI. Never creates or deletes sessions. Model allow/block filters do not apply: the session's own model is used.`,
+    description: `Send a message to an existing opencode session and return its reply. The session keeps its history and model, and the exchange appears live in any attached opencode TUI. Never creates or deletes sessions. Uses the session's own model unless \`model\` is passed, which must pass the allow/block filters (${filterSummary}).`,
     inputSchema: {
       session_id: z.string().describe("Session ID from list_sessions"),
       prompt: z.string().describe("The message to send"),
@@ -471,6 +479,12 @@ server.registerTool(
         .optional()
         .describe(
           "opencode agent to handle the message (e.g. 'build', 'plan')",
+        ),
+      model: z
+        .string()
+        .optional()
+        .describe(
+          "Model for this message in provider/model format (default: the session's own model)",
         ),
       port: z
         .number()
