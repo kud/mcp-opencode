@@ -15,8 +15,10 @@ and opencode's local HTTP API on the other.
    background and waits for it to become ready.
 3. Each `query` call creates a temporary opencode session, sends the prompt,
    waits for the response, then deletes the session.
-4. `list_sessions`, `send` and `read` work on sessions that already exist,
-   typically the one you have open in the opencode TUI.
+4. `list_sessions`, `send` and `read` work on sessions that already exist in
+   your opencode windows. They discover the windows themselves: every opencode
+   process listening on a local port (found with `lsof`, then probed) counts.
+   A window started without `--port` opens no port and can't be seen.
 5. Authentication is handled entirely by opencode — configure your providers
    once in opencode and this MCP inherits them automatically.
 
@@ -40,6 +42,7 @@ itself.
 
 **`send` is conversational.** It talks to a session that already exists and
 never deletes it, so history carries over from message to message. Start
-opencode on the same port (`opencode --port 4096`) and whatever your assistant
-sends shows up live in your TUI, where you can pick the conversation up
-yourself.
+opencode with a port (`opencode --port 4097`) and whatever your assistant
+sends shows up live in that window, where you can pick the conversation up
+yourself. When the same project is open in two windows, `send` uses the
+lowest port and says so; only that window streams the exchange live.

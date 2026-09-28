@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
-import { createOpencodeClient } from "@opencode-ai/sdk/client"
+import { createOpencodeClient, type Session } from "@opencode-ai/sdk/client"
 import { execSync, spawn } from "child_process"
 import { z } from "zod"
 
@@ -54,7 +54,8 @@ const ensureServer = async () => {
   await new Promise((resolve) => setTimeout(resolve, 2000))
 }
 
-const getClient = () => createOpencodeClient({ baseUrl: OPENCODE_SERVER_URL })
+const getClient = (baseUrl = OPENCODE_SERVER_URL) =>
+  createOpencodeClient({ baseUrl })
 
 // ─── Query ───
 
@@ -193,21 +194,126 @@ const condenseParts = (parts: SessionPart[]) =>
     .filter(Boolean)
     .join("\n")
 
+// ─── Discovery ───
+
+type OpencodeServer = { port: number; url: string }
+
+const LOCAL_HOSTS = new Set(["127.0.0.1", "[::1]", "localhost", "*"])
+const PROBE_TIMEOUT_MS = 300
+const NO_WINDOWS_MESSAGE =
+  "No opencode windows found. A plain `opencode` opens no port: start it with `opencode --port <port>` (or the `oc` wrapper) so it can be discovered."
+
+const listeningOpencodePorts = () => {
+  try {
+    const output = execSync("lsof -nP -a -c opencode -iTCP -sTCP:LISTEN -Fn", {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    })
+    const ports = String(output)
+      .split("\n")
+      .filter((line) => line.startsWith("n"))
+      .map((line) => {
+        const address = line.slice(1)
+        const separator = address.lastIndexOf(":")
+        return {
+          host: address.slice(0, separator),
+          port: Number(address.slice(separator + 1)),
+        }
+      })
+      .filter(({ host, port }) => LOCAL_HOSTS.has(host) && port > 0)
+      .map(({ port }) => port)
+    return [...new Set(ports)].sort((a, b) => a - b)
+  } catch {
+    return []
+  }
+}
+
+const answersAsOpencode = async (url: string) => {
+  try {
+    const response = await fetch(`${url}/session`, {
+      signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
+    })
+    return response.ok && Array.isArray(await response.json())
+  } catch {
+    return false
+  }
+}
+
+export const discoverServers = async (): Promise<OpencodeServer[]> => {
+  if (process.env.MCP_OPENCODE_URL)
+    return [{ port: Number(SERVER_PORT), url: OPENCODE_SERVER_URL }]
+
+  const candidates = listeningOpencodePorts().map((port) => ({
+    port,
+    url: `http://127.0.0.1:${port}`,
+  }))
+  const reachable = await Promise.all(
+    candidates.map((server) => answersAsOpencode(server.url)),
+  )
+  return candidates.filter((_, i) => reachable[i])
+}
+
+type LocatedSession = Session & { ports: number[] }
+
+const sessionsByServer = async (
+  servers: OpencodeServer[],
+  directory?: string,
+) => {
+  const located = new Map<string, LocatedSession>()
+  for (const server of servers) {
+    const response = await getClient(server.url).session.list(
+      directory ? { query: { directory } } : {},
+    )
+    for (const session of response.data ?? []) {
+      const existing = located.get(session.id)
+      if (existing) existing.ports.push(server.port)
+      else located.set(session.id, { ...session, ports: [server.port] })
+    }
+  }
+  return located
+}
+
+const resolveSessionServer = async (session_id: string, port?: number) => {
+  const servers = await discoverServers()
+  if (port !== undefined) {
+    const chosen = servers.find((s) => s.port === port)
+    if (!chosen)
+      throw new Error(`no opencode window is listening on port ${port}`)
+    return { server: chosen, otherPorts: [] as number[] }
+  }
+  if (servers.length === 0) throw new Error(NO_WINDOWS_MESSAGE)
+
+  const session = (await sessionsByServer(servers)).get(session_id)
+  if (!session)
+    throw new Error(
+      `session "${session_id}" not found in any opencode window. Use list_sessions to see what's open.`,
+    )
+  const [first, ...otherPorts] = session.ports
+  return {
+    server: servers.find((s) => s.port === first) as OpencodeServer,
+    otherPorts,
+  }
+}
+
+const otherWindowsNote = (server: OpencodeServer, otherPorts: number[]) =>
+  otherPorts.length
+    ? `\n\n(Sent via the window on port ${server.port}. Windows on ${otherPorts.join(", ")} share this session but won't show it live.)`
+    : ""
+
 export const listSessions = async ({
   directory,
 }: {
   directory?: string
 } = {}) => {
   try {
-    await ensureServer()
-    const response = await getClient().session.list(
-      directory ? { query: { directory } } : {},
-    )
-    const lines = [...(response.data ?? [])]
+    const servers = await discoverServers()
+    if (servers.length === 0) return textResult(NO_WINDOWS_MESSAGE)
+
+    const lines = [...(await sessionsByServer(servers, directory)).values()]
       .sort((a, b) => b.time.updated - a.time.updated)
       .map(
         (s) =>
-          `${s.id}  ${s.title || "(untitled)"}  ${s.directory}  updated ${new Date(s.time.updated).toISOString()}`,
+          `${s.id}  ${s.title || "(untitled)"}  ${s.directory}  port ${s.ports.join(", ")}  updated ${new Date(s.time.updated).toISOString()}`,
       )
     return textResult(lines.join("\n") || "No sessions found")
   } catch (e) {
@@ -219,16 +325,18 @@ export const send = async ({
   session_id,
   prompt,
   agent,
+  port,
   timeout_seconds = DEFAULT_SEND_TIMEOUT_SECONDS,
 }: {
   session_id: string
   prompt: string
   agent?: string
+  port?: number
   timeout_seconds?: number
 }) => {
   try {
-    await ensureServer()
-    const reply = getClient().session.prompt({
+    const { server, otherPorts } = await resolveSessionServer(session_id, port)
+    const reply = getClient(server.url).session.prompt({
       path: { id: session_id },
       body: {
         parts: [{ type: "text", text: prompt }],
@@ -257,9 +365,9 @@ export const send = async ({
       )
     }
 
+    const text = condenseParts((response.data?.parts ?? []) as SessionPart[])
     return textResult(
-      condenseParts((response.data?.parts ?? []) as SessionPart[]) ||
-        "Error: no response",
+      text ? text + otherWindowsNote(server, otherPorts) : "Error: no response",
     )
   } catch (e) {
     return errorResult(e)
@@ -269,13 +377,15 @@ export const send = async ({
 export const read = async ({
   session_id,
   limit = 20,
+  port,
 }: {
   session_id: string
   limit?: number
+  port?: number
 }) => {
   try {
-    await ensureServer()
-    const response = await getClient().session.messages({
+    const { server } = await resolveSessionServer(session_id, port)
+    const response = await getClient(server.url).session.messages({
       path: { id: session_id },
       query: { limit },
     })
@@ -337,7 +447,7 @@ server.registerTool(
 server.registerTool(
   "list_sessions",
   {
-    description: `List sessions on the running opencode server (${OPENCODE_SERVER_URL}), most recently updated first. Use this to find a live session — e.g. one open in the opencode TUI — to talk to with send.`,
+    description: `List sessions across every open opencode window (discovered automatically; only windows started with --port are visible), most recently updated first, with the port(s) each is open on. Use this to find a live session to talk to with send.`,
     inputSchema: {
       directory: z
         .string()
@@ -360,6 +470,13 @@ server.registerTool(
         .optional()
         .describe(
           "opencode agent to handle the message (e.g. 'build', 'plan')",
+        ),
+      port: z
+        .number()
+        .int()
+        .optional()
+        .describe(
+          "Port of the opencode window to use (default: the window that owns the session; lowest port if several)",
         ),
       timeout_seconds: z
         .number()
@@ -386,6 +503,13 @@ server.registerTool(
         .positive()
         .optional()
         .describe("Number of most recent messages to return (default: 20)"),
+      port: z
+        .number()
+        .int()
+        .optional()
+        .describe(
+          "Port of the opencode window to read from (default: discovered)",
+        ),
     },
   },
   read,
