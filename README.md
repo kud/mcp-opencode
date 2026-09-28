@@ -16,8 +16,9 @@
 - **Zero API key** — routes prompts through a locally running opencode server, so no provider credentials are needed in your AI client.
 - **Multi-model support** — any model configured in opencode is available; query GPT-4.1, Claude, Gemini, or any other supported provider.
 - **Model filtering** — restrict or block models via `MCP_OPENCODE_MODEL_ALLOW` and `MCP_OPENCODE_MODEL_BLOCK` environment variables using glob-style patterns.
-- **Auto-start** — if opencode is not already listening on port 4096, the server spawns it automatically in the background.
-- **Session isolation** — each `query` call creates and destroys a dedicated opencode session, preventing state leakage between calls.
+- **Talk to a live session** — `list_sessions`, `send` and `read` let your assistant hold a conversation with a running opencode session, such as the one open in your TUI, and the exchange shows up there live.
+- **Auto-start** — if opencode is not already listening on the configured port (default 4096), the server spawns `opencode serve` on that port in the background.
+- **Session isolation** — each `query` call creates and destroys its own opencode session, so one-off questions leave nothing behind.
 - **Works everywhere** — compatible with Claude Desktop, Claude Code, Cursor, Windsurf, VSCode, and any MCP-capable client.
 
 ## Install
@@ -60,12 +61,34 @@ To restrict which models are available, pass environment variables:
 }
 ```
 
+### Talking to a live opencode session
+
+Start opencode on the port the MCP server uses, so both share one server:
+
+```sh
+opencode --port 4096
+```
+
+Your assistant can then call `list_sessions` to find the session you have open, `send` to talk to it, and `read` to catch up on its history. Messages it sends appear live in your TUI.
+
+### Environment variables
+
+| Variable                    | Default                 | Purpose                                                                                                                                 |
+| --------------------------- | ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| `MCP_OPENCODE_URL`          | `http://127.0.0.1:4096` | opencode server to talk to (and to spawn, if nothing is listening on its port)                                                          |
+| `MCP_OPENCODE_SEND_TIMEOUT` | `600`                   | Seconds `send` waits for a reply before handing back and letting you `read` it later                                                    |
+| `MCP_OPENCODE_MODEL_ALLOW`  | all                     | Comma-separated models or `provider/*` patterns `query` may use                                                                         |
+| `MCP_OPENCODE_MODEL_BLOCK`  | none                    | Comma-separated models or patterns to block. Filters apply to `query` and `list_models`, not `send`, which uses the session's own model |
+
 ### Available tools
 
-| Tool          | Description                                                                                                                |
-| ------------- | -------------------------------------------------------------------------------------------------------------------------- |
-| `query`       | Send a prompt to an opencode model. Accepts `prompt` (required) and `model` (optional, default: `github-copilot/gpt-4.1`). |
-| `list_models` | List models available through the running opencode server. Accepts an optional `provider` filter (e.g. `anthropic`).       |
+| Tool            | Description                                                                                                                                                                |
+| --------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `query`         | Send a prompt to an opencode model. Accepts `prompt` (required) and `model` (optional, default: `github-copilot/gpt-4.1`).                                                 |
+| `list_models`   | List models available through the running opencode server. Accepts an optional `provider` filter (e.g. `anthropic`).                                                       |
+| `list_sessions` | List sessions on the opencode server, most recent first. Accepts an optional `directory` filter.                                                                           |
+| `send`          | Send a message to an existing session and return the reply. Accepts `session_id`, `prompt`, and optional `agent` and `timeout_seconds`. Never creates or deletes sessions. |
+| `read`          | Read a session's recent messages as a condensed transcript. Accepts `session_id` and an optional `limit` (default 20).                                                     |
 
 ## Development
 

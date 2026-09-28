@@ -9,13 +9,15 @@ and opencode's local HTTP API on the other.
 
 ## 🔄 The flow
 
-1. On first use, the server checks whether the opencode HTTP server is running
-   on `127.0.0.1:4096`.
-2. If it isn't, the server spawns `opencode serve` in the background and waits
-   for it to become ready.
+1. On first use, the server checks whether an opencode HTTP server is listening
+   on the port of `MCP_OPENCODE_URL` (default `127.0.0.1:4096`).
+2. If it isn't, the server spawns `opencode serve --port <port>` in the
+   background and waits for it to become ready.
 3. Each `query` call creates a temporary opencode session, sends the prompt,
    waits for the response, then deletes the session.
-4. Authentication is handled entirely by opencode — configure your providers
+4. `list_sessions`, `send` and `read` work on sessions that already exist,
+   typically the one you have open in the opencode TUI.
+5. Authentication is handled entirely by opencode — configure your providers
    once in opencode and this MCP inherits them automatically.
 
 ## 🖥️ Why a local server
@@ -29,9 +31,15 @@ This is the heart of the
 [zero-key delegation model](/projects/mcp-opencode/docs/) — no credentials are
 stored in or pass through the MCP server.
 
-## ♻️ Sessions are ephemeral
+## ♻️ Two kinds of session
 
-Every `query` spins up a fresh opencode session and tears it down once the
+**`query` is ephemeral.** Every `query` spins up a fresh opencode session and tears it down once the
 response is returned. There's no conversation state carried between calls — each
 prompt is self-contained. Pass everything the model needs in the `prompt`
 itself.
+
+**`send` is conversational.** It talks to a session that already exists and
+never deletes it, so history carries over from message to message. Start
+opencode on the same port (`opencode --port 4096`) and whatever your assistant
+sends shows up live in your TUI, where you can pick the conversation up
+yourself.
