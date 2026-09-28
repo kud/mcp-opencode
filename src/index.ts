@@ -11,7 +11,8 @@ const SERVER = new URL(OPENCODE_SERVER_URL)
 const SERVER_PORT = SERVER.port || "4096"
 const DEFAULT_SEND_TIMEOUT_SECONDS =
   Number(process.env.MCP_OPENCODE_SEND_TIMEOUT) || 600
-const DEFAULT_MODEL = "github-copilot/gpt-4.1"
+const DEFAULT_MODEL =
+  process.env.MCP_OPENCODE_MODEL || "github-copilot/gpt-4.1"
 
 const parsePatterns = (env: string | undefined) =>
   (env ?? "")

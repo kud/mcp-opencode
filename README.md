@@ -99,6 +99,7 @@ If the same project is open in two windows, `send` goes to the lowest port and s
 | --------------------------- | ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
 | `MCP_OPENCODE_URL`          | `http://127.0.0.1:4096` | Pin one opencode server instead of discovering windows (and the server `query` spawns if nothing listens on its port)                   |
 | `MCP_OPENCODE_SEND_TIMEOUT` | `600`                   | Seconds `send` waits for a reply before handing back and letting you `read` it later                                                    |
+| `MCP_OPENCODE_MODEL`        | `github-copilot/gpt-4.1` | Model `query` uses when none is passed                                                                                                  |
 | `MCP_OPENCODE_MODEL_ALLOW`  | all                     | Comma-separated models or `provider/*` patterns `query` may use                                                                         |
 | `MCP_OPENCODE_MODEL_BLOCK`  | none                    | Comma-separated models or patterns to block. Filters apply to `query` and `list_models`, not `send`, which uses the session's own model |
 
