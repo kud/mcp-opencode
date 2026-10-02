@@ -11,12 +11,12 @@ vi.mock("child_process", () => ({
   spawn: vi.fn(() => ({ unref: vi.fn() })),
 }))
 
-vi.mock("@opencode-ai/sdk/client", () => ({
+vi.mock("@opencode-ai/sdk/v2/client", () => ({
   createOpencodeClient: vi.fn(),
 }))
 
 import { execSync, spawn } from "child_process"
-import { createOpencodeClient } from "@opencode-ai/sdk/client"
+import { createOpencodeClient } from "@opencode-ai/sdk/v2/client"
 import {
   query,
   listModels,
@@ -145,7 +145,7 @@ describe("query", () => {
     await query({ prompt: "hello" })
 
     expect(
-      (client.session.prompt as ReturnType<typeof vi.fn>).mock.calls[0][0].body
+      (client.session.prompt as ReturnType<typeof vi.fn>).mock.calls[0][0]
         .model,
     ).toEqual({ providerID: "github-copilot", modelID: "gpt-4.1" })
   })
@@ -298,7 +298,7 @@ describe("listSessions", () => {
     await listSessions({ directory: "/some/project" })
 
     expect(client.session.list).toHaveBeenCalledWith({
-      query: { directory: "/some/project" },
+      directory: "/some/project",
     })
   })
 
@@ -365,8 +365,8 @@ describe("send", () => {
     expect(client.session.create).not.toHaveBeenCalled()
     expect(client.session.delete).not.toHaveBeenCalled()
     expect(client.session.prompt).toHaveBeenCalledWith({
-      path: { id: "session-1" },
-      body: { parts: [{ type: "text", text: "hi" }] },
+      sessionID: "session-1",
+      parts: [{ type: "text", text: "hi" }],
     })
   })
 
@@ -377,7 +377,7 @@ describe("send", () => {
     await send({ session_id: "session-1", prompt: "hi", agent: "plan" })
 
     expect(
-      (client.session.prompt as ReturnType<typeof vi.fn>).mock.calls[0][0].body
+      (client.session.prompt as ReturnType<typeof vi.fn>).mock.calls[0][0]
         .agent,
     ).toBe("plan")
   })
@@ -393,7 +393,7 @@ describe("send", () => {
     })
 
     expect(
-      (client.session.prompt as ReturnType<typeof vi.fn>).mock.calls[0][0].body
+      (client.session.prompt as ReturnType<typeof vi.fn>).mock.calls[0][0]
         .model,
     ).toEqual({ providerID: "github-copilot", modelID: "gpt-5.4" })
   })
@@ -469,8 +469,8 @@ describe("send", () => {
     await send({ session_id: "s1", prompt: "hi" })
 
     expect(owner.session.prompt).toHaveBeenCalledWith({
-      path: { id: "s1" },
-      body: { parts: [{ type: "text", text: "hi" }] },
+      sessionID: "s1",
+      parts: [{ type: "text", text: "hi" }],
     })
     expect(other.session.prompt).not.toHaveBeenCalled()
   })

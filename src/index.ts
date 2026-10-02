@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
-import { createOpencodeClient, type Session } from "@opencode-ai/sdk/client"
+import { createOpencodeClient, type Session } from "@opencode-ai/sdk/v2/client"
 import { execSync, spawn } from "child_process"
 import { z } from "zod"
 
@@ -92,11 +92,9 @@ export const query = async ({
       }
 
     const response = await client.session.prompt({
-      path: { id: sessionId },
-      body: {
-        model: { providerID, modelID },
-        parts: [{ type: "text", text: prompt }],
-      },
+      sessionID: sessionId,
+      model: { providerID, modelID },
+      parts: [{ type: "text", text: prompt }],
     })
 
     const info = response.data?.info
@@ -110,7 +108,7 @@ export const query = async ({
         providerError.data?.message ??
         providerError.message ??
         "unknown provider error"
-      await client.session.delete({ path: { id: sessionId } })
+      await client.session.delete({ sessionID: sessionId })
       return { content: [{ type: "text" as const, text: `Error: ${msg}` }] }
     }
 
@@ -120,7 +118,7 @@ export const query = async ({
       .join("")
       .trim()
 
-    await client.session.delete({ path: { id: sessionId } })
+    await client.session.delete({ sessionID: sessionId })
 
     return {
       content: [{ type: "text" as const, text: text || "Error: no response" }],
@@ -262,7 +260,7 @@ const sessionsByServer = async (
   const located = new Map<string, LocatedSession>()
   for (const server of servers) {
     const response = await getClient(server.url).session.list(
-      directory ? { query: { directory } } : {},
+      directory ? { directory } : {},
     )
     for (const session of response.data ?? []) {
       const existing = located.get(session.id)
@@ -345,12 +343,10 @@ export const send = async ({
     const { server, otherPorts } = await resolveSessionServer(session_id, port)
     const [providerID, modelID] = (model?.split("/") ?? []) as [string, string]
     const reply = getClient(server.url).session.prompt({
-      path: { id: session_id },
-      body: {
-        parts: [{ type: "text", text: prompt }],
-        ...(agent && { agent }),
-        ...(model && { model: { providerID, modelID } }),
-      },
+      sessionID: session_id,
+      parts: [{ type: "text", text: prompt }],
+      ...(agent && { agent }),
+      ...(model && { model: { providerID, modelID } }),
     })
 
     let timer: NodeJS.Timeout | undefined
@@ -394,10 +390,7 @@ export const read = async ({
 }) => {
   try {
     const { server } = await resolveSessionServer(session_id, port)
-    const response = await getClient(server.url).session.messages({
-      path: { id: session_id },
-      query: { limit },
-    })
+    const response = await getClient(server.url).session.messages({ sessionID: session_id, limit })
     const transcript = (response.data ?? [])
       .map(({ info, parts }) => {
         const body = condenseParts(parts as SessionPart[])
