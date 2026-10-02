@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest"
 
 vi.hoisted(() => {
+  process.env.MCP_OPENCODE_STATE_DIR = `${process.env.TMPDIR ?? "/tmp"}/mcp-opencode-tools-test-${process.pid}`
   process.env.MCP_OPENCODE_MODEL_ALLOW = "github-copilot/*"
   process.env.MCP_OPENCODE_MODEL_BLOCK = ""
   delete process.env.MCP_OPENCODE_MODEL
