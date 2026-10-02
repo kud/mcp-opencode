@@ -4,6 +4,27 @@ All notable changes to this project are documented here.
 
 ---
 
+## 1.6.0 — 2026-10-02
+
+### Highlights
+
+- New headless instance tools (`start_instance`, `task`, `wait`, `list_instances`, `stop_instance`) let an assistant spin up its own opencode instance, hand it a job and collect the result without a TUI. ([38aae8b](https://github.com/kud/mcp-opencode/commit/38aae8b50359a21d610db9e91fb0f9742af14297))
+- Guard rails and a background reaper keep those instances in check, and `~/.local/state/mcp-opencode/instances.json` records what is running in a documented, stable shape that other tools can read. ([38aae8b](https://github.com/kud/mcp-opencode/commit/38aae8b50359a21d610db9e91fb0f9742af14297))
+- `query` now waits for the background server to actually be ready instead of sleeping a fixed two seconds, so it starts faster when the server is quick and no longer fails when it is slow. ([38aae8b](https://github.com/kud/mcp-opencode/commit/38aae8b50359a21d610db9e91fb0f9742af14297))
+
+### Fixes
+
+- The MCP server now reports its real version from `package.json` rather than a hardcoded `1.0.0`. ([38aae8b](https://github.com/kud/mcp-opencode/commit/38aae8b50359a21d610db9e91fb0f9742af14297))
+
+<details>
+<summary>Internal (1 commit)</summary>
+
+- Upgraded `@opencode-ai/sdk` to 1.18.34 and migrated to its v2 client.
+
+</details>
+
+---
+
 ## 1.5.0 — 2026-09-28
 
 ### Highlights
