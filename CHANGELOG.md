@@ -4,6 +4,17 @@ All notable changes to this project are documented here.
 
 ---
 
+## 1.8.0 — 2026-10-03
+
+### Highlights
+
+- Headless instances can now run inside an OS sandbox: set `MCP_OPENCODE_SANDBOX=srt` and `opencode serve` is wrapped in `srt` (@anthropic-ai/sandbox-runtime). Opt-in, off by default. ([0455a27](https://github.com/kud/mcp-opencode/commit/0455a272572d472f80384436d8d966116354cc42))
+- Each sandboxed instance gets its own generated settings: writes only to its directory, git dirs, opencode's own dirs and temp dirs; credential paths unreadable; network limited to opencode model endpoints, GitHub, npm and localhost. ([0455a27](https://github.com/kud/mcp-opencode/commit/0455a272572d472f80384436d8d966116354cc42))
+- `MCP_OPENCODE_SANDBOX_SETTINGS` swaps in your own settings file, and the instance refuses to start rather than run unsandboxed when `srt` is missing. ([0455a27](https://github.com/kud/mcp-opencode/commit/0455a272572d472f80384436d8d966116354cc42))
+- Sandboxed instances also carry extra bash denies, and `list_instances` now shows `sandbox` for each one. ([0455a27](https://github.com/kud/mcp-opencode/commit/0455a272572d472f80384436d8d966116354cc42))
+
+---
+
 ## 1.7.0 — 2026-10-03
 
 ### Highlights
