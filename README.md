@@ -105,6 +105,8 @@ For work you want done in the background rather than in a window you are watchin
 
 **Guard rails.** Nobody is there to answer a permission prompt, so a task's session never gets one: reading, editing and shell commands are allowed, while `git push`, `git remote`, `gh`, `npm publish`, `git reset --hard`, web fetches, questions and anything outside the directory are denied. The server itself runs with no git credentials (`GIT_TERMINAL_PROMPT=0`, `GIT_SSH_COMMAND=false`, an empty `credential.helper`), without `GH_TOKEN`/`GITHUB_TOKEN`, and with its model pinned to `MCP_OPENCODE_MODEL`.
 
+**Model fallback.** A job tries `[its model, ...MCP_OPENCODE_MODEL_FALLBACK]` once each, in order. When the session stays in `retry` for `MCP_OPENCODE_RETRY_TIMEOUT_SECONDS` (default 90) or its reply ends in a provider error (`APIError`, `ProviderAuthError`, model not found), the watchdog aborts it and re-prompts the same session on the next model, so history and worktree edits carry over. When the list is exhausted the job settles as `error`. `wait` and `list_instances` report the current `model` and the `fallbacks` taken (`{ from, to, reason, at }`), and `wait` reports `retry` as its own status.
+
 **Watching or stepping in.** Paste the `attach` command from `task` into a terminal:
 
 ```sh
@@ -131,6 +133,15 @@ Instances are recorded in `~/.local/state/mcp-opencode/instances.json` (or `$MCP
         "title": "add health check",
         "model": "github-copilot/gpt-4.1",
         "startedAt": "2026-10-02T12:04:35.021Z",
+        // model switches so far, oldest first; empty until one happens
+        "fallbacks": [
+          {
+            "from": "github-copilot/gpt-4.1",
+            "to": "github-copilot/gpt-5",
+            "reason": "retry timeout after 90s (attempt 3: rate limited)",
+            "at": "2026-10-02T12:06:05.111Z",
+          },
+        ],
       },
     ],
   },
@@ -141,15 +152,17 @@ Live state (busy or idle, last activity) is deliberately not in the file: read i
 
 ### Environment variables
 
-| Variable                    | Default                       | Purpose                                                                                                                                                               |
-| --------------------------- | ----------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `MCP_OPENCODE_URL`          | `http://127.0.0.1:4096`       | Pin one opencode server instead of discovering windows (and the server `query` spawns if nothing listens on its port)                                                 |
-| `MCP_OPENCODE_SEND_TIMEOUT` | `600`                         | Seconds `send` waits for a reply before handing back and letting you `read` it later                                                                                  |
-| `MCP_OPENCODE_MODEL`        | `github-copilot/gpt-4.1`      | Model `query` uses when none is passed                                                                                                                                |
-| `MCP_OPENCODE_MODEL_ALLOW`  | all                           | Comma-separated models or `provider/*` patterns `query` may use                                                                                                       |
-| `MCP_OPENCODE_MODEL_BLOCK`  | none                          | Comma-separated models or patterns to block. Filters apply to `query`, `list_models` and a `model` passed to `send`; without one, `send` uses the session's own model |
-| `MCP_OPENCODE_INSTANCE_TTL` | `1800`                        | Seconds every session on an instance may sit idle before the reaper stops it                                                                                          |
-| `MCP_OPENCODE_STATE_DIR`    | `~/.local/state/mcp-opencode` | Where the instance registry (`instances.json`) and instance logs live                                                                                                 |
+| Variable                             | Default                       | Purpose                                                                                                                                                                                                               |
+| ------------------------------------ | ----------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `MCP_OPENCODE_URL`                   | `http://127.0.0.1:4096`       | Pin one opencode server instead of discovering windows (and the server `query` spawns if nothing listens on its port)                                                                                                 |
+| `MCP_OPENCODE_SEND_TIMEOUT`          | `600`                         | Seconds `send` waits for a reply before handing back and letting you `read` it later                                                                                                                                  |
+| `MCP_OPENCODE_MODEL`                 | `github-copilot/gpt-4.1`      | Model `query` uses when none is passed                                                                                                                                                                                |
+| `MCP_OPENCODE_MODEL_ALLOW`           | all                           | Comma-separated models or `provider/*` patterns `query` may use                                                                                                                                                       |
+| `MCP_OPENCODE_MODEL_BLOCK`           | none                          | Comma-separated models or patterns to block. Filters apply to `query`, `list_models` and a `model` passed to `send`; without one, `send` uses the session's own model                                                 |
+| `MCP_OPENCODE_MODEL_FALLBACK`        | none                          | Ordered, comma-separated fallback models (`provider/model`) a headless job tries in order after its chosen model when that model stalls or fails. Filtered by the allow/block filters; disallowed entries are dropped |
+| `MCP_OPENCODE_RETRY_TIMEOUT_SECONDS` | `90`                          | Seconds a job's session may stay continuously in `retry` before the watchdog switches it to the next fallback model                                                                                                   |
+| `MCP_OPENCODE_INSTANCE_TTL`          | `1800`                        | Seconds every session on an instance may sit idle before the reaper stops it                                                                                                                                          |
+| `MCP_OPENCODE_STATE_DIR`             | `~/.local/state/mcp-opencode` | Where the instance registry (`instances.json`) and instance logs live                                                                                                                                                 |
 
 ### Available tools
 
@@ -161,9 +174,9 @@ Live state (busy or idle, last activity) is deliberately not in the file: read i
 | `send`           | Send a message to an existing session and return the reply. Accepts `session_id`, `prompt`, and optional `agent`, `model` (allowlist-checked; defaults to the session's own), `port` and `timeout_seconds`. Routes to the window that owns the session. Never creates or deletes sessions. |
 | `read`           | Read a session's recent messages as a condensed transcript. Accepts `session_id` and optional `limit` (default 20) and `port`.                                                                                                                                                             |
 | `start_instance` | Start a private headless opencode server in `directory`. Returns `{ port, url }`.                                                                                                                                                                                                          |
-| `task`           | Start a job on an instance: `port`, `prompt`, optional `model` (allowlist-checked), `agent` (default `build`) and `title`. Returns `{ session_id, port, attach }` at once.                                                                                                                 |
-| `wait`           | Wait for a job (`port`, `session_id`, `timeout_seconds` up to 570). Returns status, last assistant text and changed files.                                                                                                                                                                 |
-| `list_instances` | Reap, then list registered instances with their task sessions' live status.                                                                                                                                                                                                                |
+| `task`           | Start a job on an instance: `port`, `prompt`, optional `model` (allowlist-checked), `agent` (default `build`) and `title`. Tries `[model, ...fallbacks]` in order when a model stalls or fails. Returns `{ session_id, port, attach }` at once.                                            |
+| `wait`           | Wait for a job (`port`, `session_id`, `timeout_seconds` up to 570). Returns status (`idle`, `busy`, `retry` or `error`), the current `model`, the `fallbacks` taken so far, last assistant text and changed files (diffed from the job's first prompt).                                    |
+| `list_instances` | Reap, then list registered instances with their task sessions' live status, current `model` and `fallbacks`.                                                                                                                                                                               |
 | `stop_instance`  | Abort busy sessions, stop the server on `port` and confirm the port has closed.                                                                                                                                                                                                            |
 
 ## Development

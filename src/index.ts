@@ -51,6 +51,22 @@ export const isModelAllowed = (model: string) => {
   return allowed && !blocked
 }
 
+export const getFallbackModels = (): string[] => {
+  const seen = new Set<string>()
+  const out: string[] = []
+  for (const m of parsePatterns(process.env.MCP_OPENCODE_MODEL_FALLBACK)) {
+    if (!isModelAllowed(m) || seen.has(m)) continue
+    seen.add(m)
+    out.push(m)
+  }
+  return out
+}
+
+export const getRetryTimeoutSeconds = (): number => {
+  const n = Number(process.env.MCP_OPENCODE_RETRY_TIMEOUT_SECONDS)
+  return Number.isFinite(n) && n > 0 ? n : 90
+}
+
 const isServerRunning = () => {
   try {
     execSync(`lsof -i :${SERVER_PORT} -sTCP:LISTEN -t`, { stdio: "ignore" })
@@ -517,11 +533,236 @@ export const hardenedInstance = (
   }
 }
 
+export type FallbackRecord = {
+  from: string
+  to: string
+  reason: string
+  at: string
+}
+
 export type InstanceSessionRecord = {
   id: string
   title: string
   model: string
   startedAt: string
+  fallbacks?: FallbackRecord[]
+}
+
+// Per-job fallback watchdog state. Started by `task`, independent of `wait`,
+// so a stalled or failing model is switched even when nobody is polling.
+type JobState = {
+  port: number
+  sessionId: string
+  directory: string
+  prompt: string
+  agent: string
+  models: string[]
+  index: number
+  fallbacks: FallbackRecord[]
+  retrySince?: number
+  timer?: NodeJS.Timeout
+  settled: boolean
+  exhaustedError: boolean
+  checking: boolean
+}
+
+const jobs = new Map<string, JobState>()
+
+const WATCHDOG_POLL_MS = 1000
+
+const jobKey = (port: number, sessionId: string) => `${port}:${sessionId}`
+
+export const clearJobWatchdogs = () => {
+  for (const job of jobs.values()) {
+    if (job.timer) clearInterval(job.timer)
+  }
+  jobs.clear()
+}
+
+const clearJob = (job: JobState) => {
+  if (job.timer) {
+    clearInterval(job.timer)
+    job.timer = undefined
+  }
+  jobs.delete(jobKey(job.port, job.sessionId))
+}
+
+const clearJobsForPort = (port: number) => {
+  for (const job of [...jobs.values()]) {
+    if (job.port === port) clearJob(job)
+  }
+}
+
+const updateRegistrySession = (
+  port: number,
+  sessionId: string,
+  model: string,
+  fallbacks: FallbackRecord[],
+) => {
+  writeRegistry(
+    readRegistry().map((r) =>
+      r.port === port
+        ? {
+            ...r,
+            sessions: (r.sessions ?? []).map((s) =>
+              s.id === sessionId ? { ...s, model, fallbacks } : s,
+            ),
+          }
+        : r,
+    ),
+  )
+}
+
+const PROVIDER_ERROR_NAMES = new Set(["APIError", "ProviderAuthError"])
+
+export const isProviderError = (error?: {
+  name?: string
+  data?: { message?: string }
+}) => {
+  if (!error) return false
+  if (error.name && PROVIDER_ERROR_NAMES.has(error.name)) return true
+  return /model not found/i.test(String(error.data?.message ?? ""))
+}
+
+const providerErrorReason = (error: {
+  name?: string
+  data?: { message?: string }
+}) =>
+  `provider error (${error.name ?? "error"}: ${error.data?.message ?? error.name ?? "unknown provider error"})`
+
+const switchJobModel = async (job: JobState, reason: string) => {
+  const from = job.models[job.index]
+  const next = job.models[job.index + 1]
+  if (!next) {
+    job.settled = true
+    job.exhaustedError = true
+    if (job.timer) {
+      clearInterval(job.timer)
+      job.timer = undefined
+    }
+    try {
+      const instance = findInstance(job.port)
+      if (instance) {
+        await getClient(
+          instanceUrl(job.port),
+          instance.directory,
+        ).session.abort({
+          sessionID: job.sessionId,
+          directory: instance.directory,
+        })
+      }
+    } catch {}
+    return
+  }
+  const instance = findInstance(job.port)
+  if (!instance) {
+    job.settled = true
+    if (job.timer) clearInterval(job.timer)
+    jobs.delete(jobKey(job.port, job.sessionId))
+    return
+  }
+  const client = getClient(instanceUrl(job.port), instance.directory)
+  try {
+    await client.session
+      .abort({ sessionID: job.sessionId, directory: instance.directory })
+      .catch(() => {})
+    const [providerID, modelID] = next.split("/") as [string, string]
+    await client.session.promptAsync({
+      sessionID: job.sessionId,
+      directory: instance.directory,
+      agent: job.agent,
+      model: { providerID, modelID },
+      parts: [{ type: "text", text: job.prompt }],
+    })
+  } catch {}
+  job.index += 1
+  job.retrySince = undefined
+  job.fallbacks.push({ from, to: next, reason, at: new Date().toISOString() })
+  updateRegistrySession(job.port, job.sessionId, next, [...job.fallbacks])
+}
+
+const checkJob = async (key: string) => {
+  const job = jobs.get(key)
+  if (!job || job.settled || job.checking) return
+  job.checking = true
+  try {
+    const instance = findInstance(job.port)
+    if (!instance) {
+      clearJob(job)
+      return
+    }
+    const client = getClient(instanceUrl(job.port), instance.directory)
+    const [statusRes, msgRes] = await Promise.all([
+      client.session.status({ directory: instance.directory }),
+      client.session.messages({
+        sessionID: job.sessionId,
+        directory: instance.directory,
+      }),
+    ])
+    const live = (
+      (statusRes.data ?? {}) as Record<
+        string,
+        { type: SessionStatusType; attempt?: number; message?: string }
+      >
+    )[job.sessionId]
+    const entries = (msgRes.data ?? []) as MessageEntry[]
+    const last = entries.at(-1)
+    if (
+      last?.info.role === "assistant" &&
+      last.info.error &&
+      isProviderError(
+        last.info.error as { name?: string; data?: { message?: string } },
+      )
+    ) {
+      await switchJobModel(
+        job,
+        providerErrorReason(
+          last.info.error as { name?: string; data?: { message?: string } },
+        ),
+      )
+      return
+    }
+    if (live?.type === "retry") {
+      if (job.retrySince === undefined) {
+        job.retrySince = Date.now()
+      } else if (
+        Date.now() - job.retrySince >=
+        getRetryTimeoutSeconds() * 1000
+      ) {
+        const detail = live.message
+          ? ` (attempt ${live.attempt ?? "?"}: ${live.message})`
+          : ""
+        await switchJobModel(
+          job,
+          `retry timeout after ${getRetryTimeoutSeconds()}s${detail}`,
+        )
+      }
+    } else {
+      job.retrySince = undefined
+      const settled =
+        !live || live.type === "idle" ? settledOutcome(entries) : undefined
+      if (settled) {
+        job.settled = true
+        if (job.timer) {
+          clearInterval(job.timer)
+          job.timer = undefined
+        }
+      }
+    }
+  } catch {
+    // Transient probe failures must not kill the watchdog.
+  } finally {
+    const current = jobs.get(key)
+    if (current) current.checking = false
+  }
+}
+
+const startJobWatchdog = (job: JobState) => {
+  if (job.models.length <= 1) return
+  job.timer = setInterval(() => {
+    void checkJob(jobKey(job.port, job.sessionId))
+  }, WATCHDOG_POLL_MS)
+  job.timer.unref?.()
 }
 
 // Stable contract: other tools read instances.json directly. Live state
@@ -648,6 +889,7 @@ export const reapInstances = async (now = Date.now()) => {
   for (const row of readRegistry()) {
     if (!isPidAlive(row.pid)) {
       deregisterInstance(row.port)
+      clearJobsForPort(row.port)
       reaped.push(row.port)
       continue
     }
@@ -663,6 +905,7 @@ export const reapInstances = async (now = Date.now()) => {
     if (now - lastActivity <= INSTANCE_TTL_MS) continue
     if (isOpencodeProcess(row.pid)) terminate(row.pid)
     deregisterInstance(row.port)
+    clearJobsForPort(row.port)
     reaped.push(row.port)
   }
   return reaped
@@ -673,6 +916,7 @@ export const killOwnedInstances = () => {
   const owned = rows.filter((r) => r.mcpPid === process.pid)
   if (owned.length === 0) return
   owned.forEach((r) => terminate(r.pid))
+  owned.forEach((r) => clearJobsForPort(r.port))
   try {
     writeRegistry(rows.filter((r) => r.mcpPid !== process.pid))
   } catch {}
@@ -784,12 +1028,35 @@ export const task = async ({
         `Error: prompt was not accepted: ${JSON.stringify(sent.error)}`,
       )
 
+    const models = [chosenModel, ...getFallbackModels()].filter(
+      (m, i, all) => all.indexOf(m) === i,
+    )
+
     recordInstanceSession(port, {
       id: sessionId,
       title: created.data?.title ?? title ?? "",
       model: chosenModel,
       startedAt: new Date().toISOString(),
+      fallbacks: [],
     })
+
+    const key = jobKey(port, sessionId)
+    jobs.delete(key)
+    const job: JobState = {
+      port,
+      sessionId,
+      directory: instance.directory,
+      prompt,
+      agent,
+      models,
+      index: 0,
+      fallbacks: [],
+      settled: false,
+      exhaustedError: false,
+      checking: false,
+    }
+    jobs.set(key, job)
+    startJobWatchdog(job)
 
     return jsonResult({
       session_id: sessionId,
@@ -847,6 +1114,7 @@ export const wait = async ({
     Date.now() + Math.min(timeout_seconds, MAX_WAIT_SECONDS) * 1000
 
   try {
+    const key = jobKey(port, session_id)
     const snapshot = async () => {
       const [statuses, messages] = await Promise.all([
         client.session.status({ directory }),
@@ -858,18 +1126,57 @@ export const wait = async ({
       )[session_id]?.type
       const settled =
         live && live !== "idle" ? undefined : settledOutcome(entries)
-      return { entries, status: settled ?? ("busy" as const) }
+      const status =
+        settled ?? (live === "retry" ? ("retry" as const) : ("busy" as const))
+      return { entries, status }
+    }
+
+    const jobReport = () => {
+      const job = jobs.get(key)
+      if (job) return { model: job.models[job.index], fallbacks: job.fallbacks }
+      const stored = readRegistry()
+        .find((r) => r.port === port)
+        ?.sessions?.find((s) => s.id === session_id)
+      return {
+        ...(stored?.model !== undefined && { model: stored.model }),
+        fallbacks: stored?.fallbacks ?? [],
+      }
     }
 
     let current = await snapshot()
-    while (current.status === "busy" && Date.now() < deadline) {
+    while (Date.now() < deadline) {
+      const job = jobs.get(key)
+      if (current.status === "error" && job && !job.exhaustedError) {
+        const last = current.entries.at(-1)
+        if (
+          last?.info.role === "assistant" &&
+          last.info.error &&
+          isProviderError(
+            last.info.error as { name?: string; data?: { message?: string } },
+          )
+        ) {
+          await checkJob(key)
+          current = await snapshot()
+          if (current.status === "busy" || current.status === "retry") {
+            await sleep(Math.min(WAIT_POLL_INTERVAL_MS, deadline - Date.now()))
+            current = await snapshot()
+            continue
+          }
+        }
+      }
+      if (current.status !== "busy" && current.status !== "retry") break
       await sleep(Math.min(WAIT_POLL_INTERVAL_MS, deadline - Date.now()))
       current = await snapshot()
     }
 
-    // opencode keeps diffs per user message; the last prompt is this job.
-    const promptId = current.entries.findLast((m) => m.info.role === "user")
-      ?.info.id
+    const finalJob = jobs.get(key)
+    if (finalJob?.exhaustedError && current.status !== "idle")
+      current = { ...current, status: "error" as const }
+
+    // opencode keeps diffs per user message; the first prompt is this job's
+    // baseline, so fallbacks re-prompting the same session don't re-base it.
+    const promptId = current.entries.find((m) => m.info.role === "user")?.info
+      .id
     const diff = promptId
       ? await client.session.diff({
           sessionID: session_id,
@@ -887,7 +1194,8 @@ export const wait = async ({
       session_id,
       port,
       status: current.status,
-      ...(current.status === "busy" && {
+      ...jobReport(),
+      ...((current.status === "busy" || current.status === "retry") && {
         note: `Still running at the timeout. Call wait again, or attach: ${attachCommand(port, session_id)}`,
       }),
       last_assistant_text: lastAssistantText(current.entries),
@@ -910,6 +1218,7 @@ export const listInstances = async () => {
           return {
             ...row,
             sessions: (row.sessions ?? []).map((s) => ({
+              fallbacks: [],
               ...s,
               status: live.get(s.id)?.status ?? "missing",
               updated: live.get(s.id)?.updated,
@@ -965,6 +1274,7 @@ export const stopInstance = async ({ port }: { port: number }) => {
       closed = await waitForPortToClose(port)
     }
     deregisterInstance(port)
+    clearJobsForPort(port)
     return jsonResult({ port, stopped: closed, aborted_sessions: aborted })
   } catch (e) {
     return errorResult(e)
@@ -1136,7 +1446,7 @@ server.registerTool(
 server.registerTool(
   "wait",
   {
-    description: `Wait for a task's session to finish, polling every ${WAIT_POLL_INTERVAL_MS / 1000}s. Returns its status (idle, busy or error), the last assistant text, and the files it changed with line counts. Stops at the timeout with status busy; call it again to keep waiting.`,
+    description: `Wait for a task's session to finish, polling every ${WAIT_POLL_INTERVAL_MS / 1000}s. Returns its status (idle, busy, retry or error), the current model, the model fallbacks taken so far, the last assistant text, and the files it changed with line counts. Stops at the timeout with status busy or retry; call it again to keep waiting.`,
     inputSchema: {
       port: z.number().int().describe("Port of the instance"),
       session_id: z.string().describe("Session ID returned by task"),
@@ -1156,7 +1466,7 @@ server.registerTool(
   "list_instances",
   {
     description:
-      "List the instances started by start_instance, with each session's live status. Reaps dead and idle instances first.",
+      "List the instances started by start_instance, with each session's live status, current model and model fallbacks. Reaps dead and idle instances first.",
     inputSchema: {},
   },
   listInstances,
