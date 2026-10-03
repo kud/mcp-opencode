@@ -4,6 +4,16 @@ All notable changes to this project are documented here.
 
 ---
 
+## 1.7.0 — 2026-10-03
+
+### Highlights
+
+- Headless jobs can now fall back to another model when the current one stalls or fails: set `MCP_OPENCODE_MODEL_FALLBACK` to an ordered list of models, filtered through the existing allowlist. ([0d4319f](https://github.com/kud/mcp-opencode/commit/0d4319f8c888adba13a1a892e83631db6362e4e5))
+- A per-job watchdog moves to the next model and re-prompts the same session when it sits in `retry` past `MCP_OPENCODE_RETRY_TIMEOUT_SECONDS` (default 90) or ends in a provider error. ([0d4319f](https://github.com/kud/mcp-opencode/commit/0d4319f8c888adba13a1a892e83631db6362e4e5))
+- `wait` now reports `retry` as its own status, and both `wait` and `list_instances` show the current `model` and any `fallbacks` taken. ([0d4319f](https://github.com/kud/mcp-opencode/commit/0d4319f8c888adba13a1a892e83631db6362e4e5))
+
+---
+
 ## 1.6.0 — 2026-10-02
 
 ### Highlights
