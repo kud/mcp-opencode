@@ -11,15 +11,29 @@ import {
   closeSync,
   existsSync,
   mkdirSync,
+  mkdtempSync,
   openSync,
   readFileSync,
+  realpathSync,
   renameSync,
+  rmSync,
   statSync,
   writeFileSync,
 } from "fs"
 import { homedir } from "os"
 import { join } from "path"
 import { z } from "zod"
+import {
+  buildSrtSettings,
+  filterExistingPaths,
+  isSrtAvailable,
+  missingSrtError,
+  resolveGitDirs,
+  resolveSandbox,
+  sandboxBashDenyEntries,
+  tmpdirsForSandbox,
+  type SandboxKind,
+} from "./sandbox.js"
 
 const OPENCODE_SERVER_URL =
   process.env.MCP_OPENCODE_URL ?? "http://127.0.0.1:4096"
@@ -516,8 +530,14 @@ const rulesetAsConfig = (ruleset: PermissionRuleset) => {
 
 export const hardenedInstance = (
   baseEnv: NodeJS.ProcessEnv = process.env,
+  opts: { sandboxed?: boolean } = {},
 ): NodeJS.ProcessEnv => {
   const { GH_TOKEN, GITHUB_TOKEN, ...env } = baseEnv
+  // Sandboxed instances extend (never replace) the base ruleset, so the
+  // model pinning and guard rails stay identical and only gain denies.
+  const ruleset = opts.sandboxed
+    ? [...HEADLESS_PERMISSION_RULESET, ...sandboxBashDenyEntries()]
+    : HEADLESS_PERMISSION_RULESET
   return {
     ...env,
     GIT_TERMINAL_PROMPT: "0",
@@ -528,7 +548,7 @@ export const hardenedInstance = (
     OPENCODE_CONFIG_CONTENT: JSON.stringify({
       model: DEFAULT_MODEL,
       small_model: DEFAULT_MODEL,
-      permission: rulesetAsConfig(HEADLESS_PERMISSION_RULESET),
+      permission: rulesetAsConfig(ruleset),
     }),
   }
 }
@@ -775,6 +795,20 @@ export type InstanceRecord = {
   startedAt: string
   mcpPid: number
   sessions: InstanceSessionRecord[]
+  // "srt" when the server was wrapped in an OS sandbox, null otherwise.
+  // Optional so registries written before sandboxing existed still parse.
+  sandbox?: SandboxKind | null
+  // Per-instance temp dir holding the generated srt settings file.
+  // Internal: used to clean up on stop/reap.
+  sandboxSettingsDir?: string
+}
+
+// Best-effort removal of a per-instance sandbox temp dir.
+const removeSandboxDir = (dir: string | undefined) => {
+  if (!dir) return
+  try {
+    rmSync(dir, { recursive: true, force: true })
+  } catch {}
 }
 
 const instanceUrl = (port: number) => `http://127.0.0.1:${port}`
@@ -890,6 +924,7 @@ export const reapInstances = async (now = Date.now()) => {
     if (!isPidAlive(row.pid)) {
       deregisterInstance(row.port)
       clearJobsForPort(row.port)
+      removeSandboxDir(row.sandboxSettingsDir)
       reaped.push(row.port)
       continue
     }
@@ -906,6 +941,7 @@ export const reapInstances = async (now = Date.now()) => {
     if (isOpencodeProcess(row.pid)) terminate(row.pid)
     deregisterInstance(row.port)
     clearJobsForPort(row.port)
+    removeSandboxDir(row.sandboxSettingsDir)
     reaped.push(row.port)
   }
   return reaped
@@ -917,6 +953,7 @@ export const killOwnedInstances = () => {
   if (owned.length === 0) return
   owned.forEach((r) => terminate(r.pid))
   owned.forEach((r) => clearJobsForPort(r.port))
+  owned.forEach((r) => removeSandboxDir(r.sandboxSettingsDir))
   try {
     writeRegistry(rows.filter((r) => r.mcpPid !== process.pid))
   } catch {}
@@ -938,28 +975,64 @@ export const startInstance = async ({ directory }: { directory: string }) => {
     return textResult(
       `Error: the default model "${DEFAULT_MODEL}" is not allowed, so an instance can't be pinned to it. Set MCP_OPENCODE_MODEL to an allowed model.`,
     )
+  // Declared outside try so the catch can clean up a settings dir that a
+  // later failure leaves behind.
+  let sandboxSettingsDir: string | undefined
   try {
     if (!existsSync(directory) || !statSync(directory).isDirectory())
       return textResult(`Error: "${directory}" is not a directory`)
 
+    // Throws on an unsupported MCP_OPENCODE_SANDBOX value or a missing
+    // MCP_OPENCODE_SANDBOX_SETTINGS file.
+    const sandbox = resolveSandbox()
+
     await reapInstances()
     mkdirSync(STATE_DIR, { recursive: true })
+
+    let cmd = "opencode"
+    let args = ["serve", "--port", "0", "--hostname", "127.0.0.1"]
+    if (sandbox) {
+      if (!isSrtAvailable()) return textResult(`Error: ${missingSrtError()}`)
+      let settingsPath = sandbox.settingsOverride ?? null
+      if (!settingsPath) {
+        sandboxSettingsDir = mkdtempSync(join(STATE_DIR, "sandbox-"))
+        let realDir = directory
+        try {
+          realDir = realpathSync(directory)
+        } catch {}
+        const settings = buildSrtSettings({
+          directory: realDir,
+          gitDirs: resolveGitDirs(realDir),
+          tmpdirs: tmpdirsForSandbox(),
+        })
+        settings.filesystem.allowWrite = filterExistingPaths(
+          settings.filesystem.allowWrite,
+        )
+        settingsPath = join(sandboxSettingsDir, "srt-settings.json")
+        writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + "\n")
+      }
+      // Same opencode serve invocation as unsandboxed, wrapped in srt.
+      // --settings is always explicit: without it srt would read
+      // ~/.srt-settings.json, which must never decide our policy.
+      args = ["--settings", settingsPath, "--", cmd, ...args]
+      cmd = "srt"
+    }
+
     const logPath = join(STATE_DIR, `instance-${Date.now()}.log`)
     const logFd = openSync(logPath, "a")
-    const child = spawn(
-      "opencode",
-      ["serve", "--port", "0", "--hostname", "127.0.0.1"],
-      {
-        cwd: directory,
-        detached: true,
-        stdio: ["ignore", logFd, logFd],
-        env: hardenedInstance(),
-      },
-    )
+    const child = spawn(cmd, args, {
+      cwd: directory,
+      detached: true,
+      stdio: ["ignore", logFd, logFd],
+      env: hardenedInstance(process.env, { sandboxed: sandbox !== null }),
+    })
     closeSync(logFd)
     child.unref()
     const pid = child.pid
-    if (!pid) return textResult("Error: failed to spawn opencode serve")
+    if (!pid) {
+      removeSandboxDir(sandboxSettingsDir)
+      return textResult("Error: failed to spawn opencode serve")
+    }
 
     let port: number
     try {
@@ -977,9 +1050,12 @@ export const startInstance = async ({ directory }: { directory: string }) => {
       startedAt: new Date().toISOString(),
       mcpPid: process.pid,
       sessions: [],
+      sandbox: sandbox ? "srt" : null,
+      ...(sandboxSettingsDir && { sandboxSettingsDir }),
     })
     return jsonResult({ port, url: instanceUrl(port) })
   } catch (e) {
+    removeSandboxDir(sandboxSettingsDir)
     return errorResult(e)
   }
 }
@@ -1007,9 +1083,15 @@ export const task = async ({
 
   try {
     const client = getClient(instanceUrl(port), instance.directory)
+    // Sandboxed instances get the same extra bash denies as their
+    // OPENCODE_CONFIG_CONTENT, so the session and the server agree.
+    const permission =
+      instance.sandbox === "srt"
+        ? [...HEADLESS_PERMISSION_RULESET, ...sandboxBashDenyEntries()]
+        : HEADLESS_PERMISSION_RULESET
     const created = await client.session.create({
       directory: instance.directory,
-      permission: HEADLESS_PERMISSION_RULESET,
+      permission,
       ...(title && { title }),
     })
     const sessionId = created.data?.id
@@ -1211,12 +1293,15 @@ export const listInstances = async () => {
     await reapInstances()
     const rows = await Promise.all(
       readRegistry().map(async (row) => {
+        // Registries written before sandboxing existed lack the field.
+        const sandbox = row.sandbox ?? null
         try {
           const live = new Map(
             (await instanceSessions(row)).map((s) => [s.id, s]),
           )
           return {
             ...row,
+            sandbox,
             sessions: (row.sessions ?? []).map((s) => ({
               fallbacks: [],
               ...s,
@@ -1227,6 +1312,7 @@ export const listInstances = async () => {
         } catch (e) {
           return {
             ...row,
+            sandbox,
             error: e instanceof Error ? e.message : String(e),
           }
         }
@@ -1275,6 +1361,7 @@ export const stopInstance = async ({ port }: { port: number }) => {
     }
     deregisterInstance(port)
     clearJobsForPort(port)
+    removeSandboxDir(instance.sandboxSettingsDir)
     return jsonResult({ port, stopped: closed, aborted_sessions: aborted })
   } catch (e) {
     return errorResult(e)
@@ -1412,7 +1499,7 @@ server.registerTool(
 server.registerTool(
   "start_instance",
   {
-    description: `Start a private, headless opencode server for one job, rooted in \`directory\`. It listens on a free localhost port, runs with git credentials and GitHub tokens stripped, and pins its model to ${DEFAULT_MODEL}. Returns { port, url }. Idle instances are reaped after ${INSTANCE_TTL_MS / 60000} minutes; use stop_instance when done.`,
+    description: `Start a private, headless opencode server for one job, rooted in \`directory\`. It listens on a free localhost port, runs with git credentials and GitHub tokens stripped, and pins its model to ${DEFAULT_MODEL}. Returns { port, url }. Idle instances are reaped after ${INSTANCE_TTL_MS / 60000} minutes; use stop_instance when done. Set MCP_OPENCODE_SANDBOX=srt to wrap the server in an OS sandbox (needs \`srt\` on PATH).`,
     inputSchema: {
       directory: z
         .string()
