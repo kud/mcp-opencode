@@ -4,6 +4,29 @@ All notable changes to this project are documented here.
 
 ---
 
+## 2.0.0 — 2026-10-21
+
+### Breaking Changes
+
+- Requires opencode v2 (`@opencode/cli`); v1 is no longer supported. The server now talks to opencode through `@opencode/client` instead of the v1 SDK. ([2ab58e5](https://github.com/kud/mcp-opencode/commit/2ab58e5a2a4694be92dc943208927af0f1225ac0))
+- The `attach` command printed for headless instances is now `opencode --server <url> --session <id>`, with the password passed as `OPENCODE_PASSWORD`. ([2ab58e5](https://github.com/kud/mcp-opencode/commit/2ab58e5a2a4694be92dc943208927af0f1225ac0))
+- `port` now selects a server, not a TUI window. `MCP_OPENCODE_URL` defaults to the background service, and the new `MCP_OPENCODE_PASSWORD` covers a server of your own. ([2ab58e5](https://github.com/kud/mcp-opencode/commit/2ab58e5a2a4694be92dc943208927af0f1225ac0))
+- `send` with `agent` or `model` now switches the session for later turns too, and `wait` reports changed files across the whole session. ([2ab58e5](https://github.com/kud/mcp-opencode/commit/2ab58e5a2a4694be92dc943208927af0f1225ac0))
+
+Tool names and arguments are unchanged.
+
+### Highlights
+
+- Headless instances use opencode v2's native permissions, with broader denies: `git push`, `git remote` and `git reset --hard` in any form (`git -C`, `env`, `cd &&`), plus `gh` and `npm publish`. ([2ab58e5](https://github.com/kud/mcp-opencode/commit/2ab58e5a2a4694be92dc943208927af0f1225ac0))
+- Every deny is also enforced as a policy, so a repository's own opencode config cannot allow it back. ([2ab58e5](https://github.com/kud/mcp-opencode/commit/2ab58e5a2a4694be92dc943208927af0f1225ac0))
+- Instances are recorded in a state file with a per-instance password, written owner-only (`0600`); `list_instances` leaves passwords out. ([2ab58e5](https://github.com/kud/mcp-opencode/commit/2ab58e5a2a4694be92dc943208927af0f1225ac0))
+
+### Security
+
+- The sandbox blocks reads of the background service's state file, which holds its password. ([2ab58e5](https://github.com/kud/mcp-opencode/commit/2ab58e5a2a4694be92dc943208927af0f1225ac0))
+
+---
+
 ## 1.8.0 — 2026-10-03
 
 ### Highlights
