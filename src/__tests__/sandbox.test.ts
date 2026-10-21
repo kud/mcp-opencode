@@ -39,12 +39,16 @@ vi.mock("child_process", () => ({
   spawn: vi.fn(),
 }))
 
-vi.mock("@opencode-ai/sdk/v2/client", () => ({
-  createOpencodeClient: vi.fn(),
+vi.mock("@opencode/client", () => ({
+  OpenCode: { make: vi.fn() },
+}))
+
+vi.mock("@opencode/client/service", () => ({
+  Service: { discover: vi.fn(), ensure: vi.fn() },
 }))
 
 import { execSync, spawn } from "child_process"
-import { createOpencodeClient } from "@opencode-ai/sdk/v2/client"
+import { OpenCode } from "@opencode/client"
 import {
   HEADLESS_PERMISSION_RULESET,
   hardenedInstance,
@@ -62,34 +66,19 @@ import {
   resolveGitDirs,
   resolveOpencodeDirs,
   resolveSandbox,
-  sandboxBashDenyEntries,
+  sandboxShellDenyRules,
   SRT_DENY_READ,
   SRT_NETWORK_ALLOWED_DOMAINS,
 } from "../sandbox.js"
+import { makeClient } from "./fake-client.js"
 
 const mockExecSync = vi.mocked(execSync)
 const mockSpawn = vi.mocked(spawn)
-const mockCreateClient = vi.mocked(createOpencodeClient)
+const mockMakeClient = vi.mocked(OpenCode.make)
 const registryPath = join(stateDir, "instances.json")
 
 const LIVE_PID = 4242
 const DEAD_PID = 4343
-
-const makeClient = (overrides: Record<string, unknown> = {}) =>
-  ({
-    session: {
-      create: vi
-        .fn()
-        .mockResolvedValue({ data: { id: "ses_1", title: "New session" } }),
-      promptAsync: vi.fn().mockResolvedValue({ data: undefined }),
-      list: vi.fn().mockResolvedValue({ data: [] }),
-      status: vi.fn().mockResolvedValue({ data: {} }),
-      messages: vi.fn().mockResolvedValue({ data: [] }),
-      diff: vi.fn().mockResolvedValue({ data: [] }),
-      abort: vi.fn().mockResolvedValue({ data: true }),
-      ...overrides,
-    },
-  }) as unknown as ReturnType<typeof createOpencodeClient>
 
 const row = (overrides: Partial<InstanceRecord> = {}): InstanceRecord => ({
   runtime: "opencode",
@@ -101,6 +90,9 @@ const row = (overrides: Partial<InstanceRecord> = {}): InstanceRecord => ({
   sessions: [],
   ...overrides,
 })
+
+const useClient = (client: ReturnType<typeof makeClient>) =>
+  mockMakeClient.mockReturnValue(client as never)
 
 const seedRegistry = (rows: InstanceRecord[]) => {
   mkdirSync(stateDir, { recursive: true })
@@ -131,7 +123,7 @@ beforeEach(() => {
   delete process.env.MCP_OPENCODE_SANDBOX
   delete process.env.MCP_OPENCODE_SANDBOX_SETTINGS
   process.env.PATH = savedPath
-  mockCreateClient.mockReturnValue(makeClient())
+  useClient(makeClient())
   mockExecSync.mockReturnValue(Buffer.from("opencode serve"))
   killSpy = vi.spyOn(process, "kill").mockImplementation(((
     pid: number,
@@ -285,7 +277,9 @@ describe("buildSrtSettings", () => {
 
   it("denies reads of credential paths but keeps opencode config readable", () => {
     const settings = buildSrtSettings({ directory: "/repo" })
-    expect(settings.filesystem.denyRead).toEqual(SRT_DENY_READ)
+    expect(settings.filesystem.denyRead.slice(0, SRT_DENY_READ.length)).toEqual(
+      SRT_DENY_READ,
+    )
     expect(settings.filesystem.denyRead).toEqual(
       expect.arrayContaining([
         "~/.ssh",
@@ -358,45 +352,48 @@ describe("sandboxed permission config", () => {
     const env = hardenedInstance({ PATH: "/usr/bin" }, { sandboxed: true })
     const config = JSON.parse(env.OPENCODE_CONFIG_CONTENT as string)
     expect(config.model).toBe("github-copilot/gpt-4.1")
-    expect(config.small_model).toBe("github-copilot/gpt-4.1")
-    // Base denies survive the merge…
-    expect(config.permission.bash["git push*"]).toBe("deny")
-    expect(config.permission.bash["gh *"]).toBe("deny")
-    expect(config.permission.bash["*"]).toBe("allow")
-    // …and the sandbox extras are deny, never ask.
+    expect(config.agents.title.model).toBe("github-copilot/gpt-4.1")
+    // The base ruleset comes first, unchanged…
+    expect(
+      config.permissions.slice(0, HEADLESS_PERMISSION_RULESET.length),
+    ).toEqual(HEADLESS_PERMISSION_RULESET)
+    // …and the sandbox extras follow as shell denies, never ask.
+    expect(
+      config.permissions.slice(HEADLESS_PERMISSION_RULESET.length),
+    ).toEqual(sandboxShellDenyRules())
+    expect(
+      config.permissions.map((r: { effect: string }) => r.effect),
+    ).not.toContain("ask")
     for (const pattern of ["rm -rf*", "sudo *", "curl *|*", "wget *|*"])
-      expect(config.permission.bash[pattern]).toBe("deny")
-    expect(Object.values(config.permission.bash)).not.toContain("ask")
-    expect(config.permission.webfetch).toBe("deny")
-    expect(config.permission.external_directory).toBe("deny")
+      expect(config.policies).toContainEqual({
+        action: "tool.use",
+        resource: `shell:${pattern}`,
+        effect: "deny",
+      })
   })
 
-  it("leaves the unsandboxed config exactly as before", () => {
+  it("adds nothing to the unsandboxed config", () => {
     const env = hardenedInstance({ PATH: "/usr/bin" })
     const config = JSON.parse(env.OPENCODE_CONFIG_CONTENT as string)
-    expect(config.permission.bash).toEqual({
-      "*": "allow",
-      "git push*": "deny",
-      "git remote*": "deny",
-      "gh *": "deny",
-      "npm publish*": "deny",
-      "git reset --hard*": "deny",
-    })
+    expect(config.permissions).toEqual(HEADLESS_PERMISSION_RULESET)
+    expect(config.policies).not.toContainEqual(
+      expect.objectContaining({ resource: "shell:sudo *" }),
+    )
   })
 
   it("exposes the extras as session ruleset entries", () => {
-    expect(sandboxBashDenyEntries()).toEqual([
-      { permission: "bash", pattern: "rm -rf*", action: "deny" },
-      { permission: "bash", pattern: "sudo *", action: "deny" },
-      { permission: "bash", pattern: "curl *|*", action: "deny" },
-      { permission: "bash", pattern: "wget *|*", action: "deny" },
+    expect(sandboxShellDenyRules()).toEqual([
+      { action: "shell", resource: "rm -rf*", effect: "deny" },
+      { action: "shell", resource: "sudo *", effect: "deny" },
+      { action: "shell", resource: "curl *|*", effect: "deny" },
+      { action: "shell", resource: "wget *|*", effect: "deny" },
     ])
   })
 })
 
 describe("startInstance sandbox wiring", () => {
   it("spawns opencode directly with sandbox: null when unset", async () => {
-    spawnThatPrints("opencode server listening on http://127.0.0.1:53817\n")
+    spawnThatPrints("server listening on http://127.0.0.1:53817\n")
     const directory = mkdtempSync(join(stateDir, "proj-"))
 
     const before = readdirSync(stateDir).filter((f) => f.startsWith("sandbox-"))
@@ -416,7 +413,7 @@ describe("startInstance sandbox wiring", () => {
   it("wraps opencode in srt with a generated settings file", async () => {
     binWithSrt()
     process.env.MCP_OPENCODE_SANDBOX = "srt"
-    spawnThatPrints("opencode server listening on http://127.0.0.1:53817\n")
+    spawnThatPrints("server listening on http://127.0.0.1:53817\n")
     const directory = mkdtempSync(join(stateDir, "proj-"))
 
     await startInstance({ directory })
@@ -444,8 +441,16 @@ describe("startInstance sandbox wiring", () => {
     expect(settings.network.allowLocalBinding).toBe(true)
     expect(settings.network.allowedDomains).toContain("opencode.ai")
     const config = JSON.parse(options.env.OPENCODE_CONFIG_CONTENT as string)
-    expect(config.permission.bash["rm -rf*"]).toBe("deny")
-    expect(config.permission.bash["sudo *"]).toBe("deny")
+    expect(config.permissions).toContainEqual({
+      action: "shell",
+      resource: "rm -rf*",
+      effect: "deny",
+    })
+    expect(config.policies).toContainEqual({
+      action: "tool.use",
+      resource: "shell:sudo *",
+      effect: "deny",
+    })
     const rows = readRegistry()
     expect(rows).toEqual([
       expect.objectContaining({ port: 53817, sandbox: "srt" }),
@@ -460,7 +465,7 @@ describe("startInstance sandbox wiring", () => {
     writeFileSync(override, JSON.stringify({ network: {}, filesystem: {} }))
     process.env.MCP_OPENCODE_SANDBOX = "srt"
     process.env.MCP_OPENCODE_SANDBOX_SETTINGS = override
-    spawnThatPrints("opencode server listening on http://127.0.0.1:53817\n")
+    spawnThatPrints("server listening on http://127.0.0.1:53817\n")
     const directory = mkdtempSync(join(stateDir, "proj-"))
     const before = readdirSync(stateDir).filter((f) => f.startsWith("sandbox-"))
 
@@ -523,21 +528,26 @@ describe("sandbox lifecycle", () => {
   it("task uses the extended ruleset on a sandboxed instance", async () => {
     seedRegistry([row({ sandbox: "srt" })])
     const client = makeClient()
-    mockCreateClient.mockReturnValue(client)
+    useClient(client)
 
     await task({ port: 51000, prompt: "add a file" })
 
-    expect(client.session.create).toHaveBeenCalledWith({
-      directory: "/tmp/project",
-      permission: [...HEADLESS_PERMISSION_RULESET, ...sandboxBashDenyEntries()],
-    })
+    expect(client.session.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        location: { directory: "/tmp/project" },
+        permissions: [
+          ...HEADLESS_PERMISSION_RULESET,
+          ...sandboxShellDenyRules(),
+        ],
+      }),
+    )
   })
 
   it("stop_instance removes the per-instance settings dir", async () => {
     const sandboxSettingsDir = mkdtempSync(join(stateDir, "sandbox-"))
     writeFileSync(join(sandboxSettingsDir, "srt-settings.json"), "{}")
     seedRegistry([row({ sandbox: "srt", sandboxSettingsDir })])
-    mockCreateClient.mockReturnValue(makeClient())
+    useClient(makeClient())
 
     const result = JSON.parse(
       (await stopInstance({ port: 51000 })).content[0].text,
@@ -551,11 +561,13 @@ describe("sandbox lifecycle", () => {
   it("list_instances reports sandbox: srt, and null for legacy rows", async () => {
     seedRegistry([row({ port: 51001, sandbox: "srt" }), row({ port: 51002 })])
     // Live sessions updated now, so the reaper keeps both instances.
-    mockCreateClient.mockReturnValue(
+    useClient(
       makeClient({
-        list: vi.fn().mockResolvedValue({
-          data: [{ id: "s", title: "t", time: { updated: Date.now() } }],
-        }),
+        session: {
+          list: vi.fn().mockResolvedValue({
+            data: [{ id: "s", title: "t", time: { updated: Date.now() } }],
+          }),
+        },
       }),
     )
 
@@ -567,5 +579,20 @@ describe("sandbox lifecycle", () => {
     expect(rows.find((r: { port: number }) => r.port === 51002).sandbox).toBe(
       null,
     )
+  })
+})
+
+describe("service credentials", () => {
+  it("denies reads of the background service's password files", () => {
+    const opencode = resolveOpencodeDirs({}, "/home/u")
+    const settings = buildSrtSettings({ directory: "/proj", opencode })
+    expect(settings.filesystem.denyRead).toEqual(
+      expect.arrayContaining([
+        "/home/u/.config/opencode/service.json",
+        "/home/u/.local/state/opencode/service.json",
+      ]),
+    )
+    // The rest of opencode's dirs stay usable.
+    expect(settings.filesystem.allowWrite).toContain(opencode.state)
   })
 })

@@ -2,11 +2,17 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import {
-  createOpencodeClient,
-  type PermissionRuleset,
-  type Session,
-} from "@opencode-ai/sdk/v2/client"
+  OpenCode,
+  type OpenCodeClient,
+  type PermissionRule,
+  type SessionInfo,
+  type SessionMessageAssistant,
+  type SessionMessageInfo,
+  type SessionStructuredError,
+} from "@opencode/client"
+import { Service, type Endpoint } from "@opencode/client/service"
 import { execSync, spawn } from "child_process"
+import { randomBytes } from "crypto"
 import {
   closeSync,
   existsSync,
@@ -30,15 +36,15 @@ import {
   missingSrtError,
   resolveGitDirs,
   resolveSandbox,
-  sandboxBashDenyEntries,
+  sandboxShellDenyRules,
   tmpdirsForSandbox,
   type SandboxKind,
 } from "./sandbox.js"
 
-const OPENCODE_SERVER_URL =
-  process.env.MCP_OPENCODE_URL ?? "http://127.0.0.1:4096"
-const SERVER = new URL(OPENCODE_SERVER_URL)
-const SERVER_PORT = SERVER.port || "4096"
+// Unset: use opencode's shared background service, discovered (and started
+// for query/list_models) the way the TUI does. Set: use this server only.
+const CONFIGURED_URL = process.env.MCP_OPENCODE_URL
+const CONFIGURED_PASSWORD = process.env.MCP_OPENCODE_PASSWORD
 const DEFAULT_SEND_TIMEOUT_SECONDS =
   Number(process.env.MCP_OPENCODE_SEND_TIMEOUT) || 600
 const DEFAULT_MODEL = process.env.MCP_OPENCODE_MODEL || "github-copilot/gpt-4.1"
@@ -81,40 +87,175 @@ export const getRetryTimeoutSeconds = (): number => {
   return Number.isFinite(n) && n > 0 ? n : 90
 }
 
-const isServerRunning = () => {
+// "provider/model", where the model id itself may contain slashes.
+export const toModelRef = (model: string) => {
+  const separator = model.indexOf("/")
+  return {
+    providerID: model.slice(0, separator),
+    id: model.slice(separator + 1),
+  }
+}
+
+const READY_POLL_INTERVAL_MS = 100
+const RUN_POLL_INTERVAL_MS = 500
+
+const sleep = (ms: number) =>
+  new Promise<void>((resolve) => setTimeout(resolve, ms))
+
+// ─── Servers ───
+
+// opencode v2 servers use HTTP basic auth with the fixed user "opencode".
+const SERVER_USER = "opencode"
+
+type OpencodeServer = { port: number; url: string; password?: string }
+
+const basicAuth = (password: string) =>
+  `Basic ${Buffer.from(`${SERVER_USER}:${password}`).toString("base64")}`
+
+const getClient = ({
+  url,
+  password,
+}: Pick<OpencodeServer, "url" | "password">) =>
+  OpenCode.make({
+    baseUrl: url,
+    ...(password && { headers: { authorization: basicAuth(password) } }),
+  })
+
+const portOf = (url: string) => {
+  const parsed = new URL(url)
+  return Number(parsed.port || (parsed.protocol === "https:" ? 443 : 80))
+}
+
+const fromEndpoint = (endpoint: Endpoint): OpencodeServer => ({
+  url: endpoint.url,
+  port: portOf(endpoint.url),
+  ...(endpoint.auth && { password: endpoint.auth.password }),
+})
+
+const configuredServer = (url: string): OpencodeServer => ({
+  url,
+  port: portOf(url),
+  ...(CONFIGURED_PASSWORD && { password: CONFIGURED_PASSWORD }),
+})
+
+// The server query and list_models talk to: the configured one, else the
+// background service, started if it is not running yet.
+const sharedServer = async () =>
+  CONFIGURED_URL
+    ? configuredServer(CONFIGURED_URL)
+    : fromEndpoint(await Service.ensure())
+
+const PROBE_TIMEOUT_MS = 300
+
+const answersAsOpencode = async (server: OpencodeServer) => {
   try {
-    execSync(`lsof -i :${SERVER_PORT} -sTCP:LISTEN -t`, { stdio: "ignore" })
+    await getClient(server).server.info({
+      signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
+    })
     return true
   } catch {
     return false
   }
 }
 
-const SERVER_READY_TIMEOUT_MS = 10_000
-const READY_POLL_INTERVAL_MS = 100
+// ─── Runs ───
 
-const sleep = (ms: number) =>
-  new Promise<void>((resolve) => setTimeout(resolve, ms))
+type RunStatus = "idle" | "busy" | "retry" | "error"
 
-const ensureServer = async () => {
-  if (isServerRunning()) return
-  spawn(
-    "opencode",
-    ["serve", "--port", SERVER_PORT, "--hostname", SERVER.hostname],
-    { detached: true, stdio: "ignore" },
-  ).unref()
-  const deadline = Date.now() + SERVER_READY_TIMEOUT_MS
-  while (Date.now() < deadline) {
-    if (await answersAsOpencode(OPENCODE_SERVER_URL)) return
-    await sleep(READY_POLL_INTERVAL_MS)
-  }
-  throw new Error(
-    `opencode server did not answer on ${OPENCODE_SERVER_URL} within ${SERVER_READY_TIMEOUT_MS / 1000}s`,
-  )
+const isAssistant = (m: SessionMessageInfo): m is SessionMessageAssistant =>
+  m.type === "assistant"
+
+// opencode v2 closes every run with an "idle" message carrying its outcome,
+// and lists the session in /session/active while a run is in flight.
+export const runStatus = (
+  running: boolean,
+  newestFirst: SessionMessageInfo[],
+): RunStatus => {
+  const [newest] = newestFirst
+  if (!running && newest?.type === "idle")
+    return newest.outcome === "succeeded" ? "idle" : "error"
+  if (newest && isAssistant(newest) && newest.retry && !newest.time.completed)
+    return "retry"
+  return "busy"
 }
 
-const getClient = (baseUrl = OPENCODE_SERVER_URL, directory?: string) =>
-  createOpencodeClient({ baseUrl, ...(directory && { directory }) })
+const runError = (
+  newestFirst: SessionMessageInfo[],
+): SessionStructuredError | undefined => {
+  const [newest] = newestFirst
+  if (newest?.type === "idle")
+    return (
+      newest.error ??
+      (newest.outcome === "succeeded"
+        ? undefined
+        : { type: newest.outcome, message: `run ${newest.outcome}` })
+    )
+  return newestFirst.find(isAssistant)?.error
+}
+
+const assistantText = (message: SessionMessageAssistant) =>
+  message.content
+    .filter((c) => c.type === "text")
+    .map((c) => c.text.trim())
+    .filter(Boolean)
+    .join("\n")
+
+const condenseAssistant = (message: SessionMessageAssistant) =>
+  message.content
+    .map((c) => {
+      if (c.type === "text") return c.text.trim()
+      if (c.type === "tool") return `[tool: ${c.name} (${c.state.status})]`
+      return ""
+    })
+    .filter(Boolean)
+    .join("\n")
+
+const RECENT_MESSAGES = 100
+
+const recentMessages = async (client: OpenCodeClient, sessionID: string) =>
+  (
+    await client.message.list({
+      sessionID,
+      order: "desc",
+      limit: RECENT_MESSAGES,
+    })
+  ).data
+
+const runSnapshot = async (client: OpenCodeClient, sessionID: string) => {
+  const [active, newestFirst] = await Promise.all([
+    client.session.active(),
+    recentMessages(client, sessionID),
+  ])
+  return {
+    newestFirst,
+    status: runStatus(Boolean(active[sessionID]), newestFirst),
+  }
+}
+
+// Polls a run until it settles or the deadline passes.
+const settleRun = async (
+  client: OpenCodeClient,
+  sessionID: string,
+  deadline: number,
+) => {
+  let snapshot = await runSnapshot(client, sessionID)
+  while (
+    (snapshot.status === "busy" || snapshot.status === "retry") &&
+    Date.now() < deadline
+  ) {
+    await sleep(Math.min(RUN_POLL_INTERVAL_MS, deadline - Date.now()))
+    snapshot = await runSnapshot(client, sessionID)
+  }
+  return snapshot
+}
+
+// Assistant messages newer than the given user message, oldest first.
+const repliesTo = (newestFirst: SessionMessageInfo[], promptId: string) => {
+  const promptIndex = newestFirst.findIndex((m) => m.id === promptId)
+  const newer =
+    promptIndex === -1 ? newestFirst : newestFirst.slice(0, promptIndex)
+  return newer.filter(isAssistant).reverse()
+}
 
 // ─── Query ───
 
@@ -136,55 +277,38 @@ export const query = async ({
     }
 
   try {
-    await ensureServer()
-    const client = getClient()
+    const client = getClient(await sharedServer())
+    const session = await client.session.create({ model: toModelRef(model) })
 
-    const [providerID, modelID] = model.split("/") as [string, string]
-
-    const session = await client.session.create({})
-    const sessionId = session.data?.id
-    if (!sessionId)
-      return {
-        content: [
-          { type: "text" as const, text: "Error: failed to create session" },
-        ],
-      }
-
-    const response = await client.session.prompt({
-      sessionID: sessionId,
-      model: { providerID, modelID },
-      parts: [{ type: "text", text: prompt }],
-    })
-
-    const info = response.data?.info
-    const providerError =
-      info && "error" in info && info.error
-        ? (info.error as { data?: { message?: string }; message?: string })
-        : null
-
-    if (providerError) {
-      const msg =
-        providerError.data?.message ??
-        providerError.message ??
-        "unknown provider error"
-      await client.session.delete({ sessionID: sessionId })
-      return { content: [{ type: "text" as const, text: `Error: ${msg}` }] }
-    }
-
-    const text = (response.data?.parts ?? [])
-      .filter((p) => p.type === "text")
-      .map((p) => ("text" in p ? String(p.text) : ""))
-      .join("")
-      .trim()
-
-    await client.session.delete({ sessionID: sessionId })
-
-    return {
-      content: [{ type: "text" as const, text: text || "Error: no response" }],
+    try {
+      const sent = await client.session.prompt({
+        sessionID: session.id,
+        text: prompt,
+      })
+      const { status, newestFirst } = await settleRun(
+        client,
+        session.id,
+        Date.now() + DEFAULT_SEND_TIMEOUT_SECONDS * 1000,
+      )
+      if (status === "error")
+        return textResult(
+          `Error: ${runError(newestFirst)?.message ?? "unknown provider error"}`,
+        )
+      if (status !== "idle")
+        return textResult(
+          `Error: no reply within ${DEFAULT_SEND_TIMEOUT_SECONDS}s`,
+        )
+      const text = repliesTo(newestFirst, sent.id)
+        .map(assistantText)
+        .filter(Boolean)
+        .join("\n")
+        .trim()
+      return textResult(text || "Error: no response")
+    } finally {
+      await client.session.remove({ sessionID: session.id }).catch(() => {})
     }
   } catch (e) {
-    const message = e instanceof Error ? e.message : String(e)
-    return { content: [{ type: "text" as const, text: `Error: ${message}` }] }
+    return errorResult(e)
   }
 }
 
@@ -196,121 +320,56 @@ export const listModels = async ({
   provider?: string
 } = {}) => {
   try {
-    await ensureServer()
-    const client = getClient()
-    const response = await client.config.providers({})
-    const providers = response.data?.providers ?? []
+    const client = getClient(await sharedServer())
+    const { data } = await client.model.list()
 
-    const lines = providers
-      .flatMap((p) =>
-        Object.keys(p.models ?? {}).map((modelId) => `${p.id}/${modelId}`),
-      )
+    const lines = data
+      .filter((m) => m.enabled)
+      .map((m) => `${m.providerID}/${m.id}`)
       .filter(isModelAllowed)
       .filter((m) => !provider || m.startsWith(`${provider}/`))
 
-    return {
-      content: [
-        {
-          type: "text" as const,
-          text:
-            lines.join("\n") ||
-            `No models found${provider ? ` for provider "${provider}"` : ""}`,
-        },
-      ],
-    }
+    return textResult(
+      lines.join("\n") ||
+        `No models found${provider ? ` for provider "${provider}"` : ""}`,
+    )
   } catch (e) {
-    const message = e instanceof Error ? e.message : String(e)
-    return { content: [{ type: "text" as const, text: `Error: ${message}` }] }
+    return errorResult(e)
   }
 }
 
 // ─── Sessions ───
 
-const textResult = (text: string) => ({
-  content: [{ type: "text" as const, text }],
-})
-
-const errorResult = (e: unknown) =>
-  textResult(`Error: ${e instanceof Error ? e.message : String(e)}`)
-
-type SessionPart = {
-  type: string
-  text?: unknown
-  tool?: string
-  state?: { status?: string }
+function textResult(text: string) {
+  return { content: [{ type: "text" as const, text }] }
 }
 
-const condenseParts = (parts: SessionPart[]) =>
-  parts
-    .map((p) => {
-      if (p.type === "text") return String(p.text ?? "").trim()
-      if (p.type === "tool")
-        return `[tool: ${p.tool} (${p.state?.status ?? "unknown"})]`
-      return ""
-    })
-    .filter(Boolean)
-    .join("\n")
+function errorResult(e: unknown) {
+  return textResult(`Error: ${e instanceof Error ? e.message : String(e)}`)
+}
 
 // ─── Discovery ───
 
-type OpencodeServer = { port: number; url: string }
+const NO_SERVER_MESSAGE =
+  "No opencode server found. Open opencode (the TUI starts the background service) or run `opencode service start`."
 
-const LOCAL_HOSTS = new Set(["127.0.0.1", "[::1]", "localhost", "*"])
-const PROBE_TIMEOUT_MS = 300
-const NO_WINDOWS_MESSAGE =
-  "No opencode windows found. A plain `opencode` opens no port: start it with `opencode --port <port>` (or the `oc` wrapper) so it can be discovered."
-
-const listeningOpencodePorts = () => {
-  try {
-    const output = execSync("lsof -nP -a -c opencode -iTCP -sTCP:LISTEN -Fn", {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-    })
-    const ports = String(output)
-      .split("\n")
-      .filter((line) => line.startsWith("n"))
-      .map((line) => {
-        const address = line.slice(1)
-        const separator = address.lastIndexOf(":")
-        return {
-          host: address.slice(0, separator),
-          port: Number(address.slice(separator + 1)),
-        }
-      })
-      .filter(({ host, port }) => LOCAL_HOSTS.has(host) && port > 0)
-      .map(({ port }) => port)
-    return [...new Set(ports)].sort((a, b) => a - b)
-  } catch {
-    return []
-  }
-}
-
-const answersAsOpencode = async (url: string) => {
-  try {
-    const response = await fetch(`${url}/session`, {
-      signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
-    })
-    return response.ok && Array.isArray(await response.json())
-  } catch {
-    return false
-  }
-}
-
+// The background service every TUI window shares, plus the headless
+// instances from start_instance, keeping only those that answer.
 export const discoverServers = async (): Promise<OpencodeServer[]> => {
-  if (process.env.MCP_OPENCODE_URL)
-    return [{ port: Number(SERVER_PORT), url: OPENCODE_SERVER_URL }]
+  if (CONFIGURED_URL) return [configuredServer(CONFIGURED_URL)]
 
-  const candidates = listeningOpencodePorts().map((port) => ({
-    port,
-    url: `http://127.0.0.1:${port}`,
-  }))
-  const reachable = await Promise.all(
-    candidates.map((server) => answersAsOpencode(server.url)),
-  )
+  const service = await Service.discover().catch(() => undefined)
+  const candidates = [
+    ...(service ? [fromEndpoint(service)] : []),
+    ...readRegistry()
+      .filter((r) => isPidAlive(r.pid))
+      .map(instanceServer),
+  ].filter((s, i, all) => all.findIndex((o) => o.url === s.url) === i)
+  const reachable = await Promise.all(candidates.map(answersAsOpencode))
   return candidates.filter((_, i) => reachable[i])
 }
 
-type LocatedSession = Session & { ports: number[] }
+type LocatedSession = SessionInfo & { ports: number[] }
 
 const sessionsByServer = async (
   servers: OpencodeServer[],
@@ -318,10 +377,11 @@ const sessionsByServer = async (
 ) => {
   const located = new Map<string, LocatedSession>()
   for (const server of servers) {
-    const response = await getClient(server.url).session.list(
-      directory ? { directory } : {},
-    )
-    for (const session of response.data ?? []) {
+    const { data } = await getClient(server).session.list({
+      limit: RECENT_MESSAGES,
+      ...(directory && { directory }),
+    })
+    for (const session of data) {
       const existing = located.get(session.id)
       if (existing) existing.ports.push(server.port)
       else located.set(session.id, { ...session, ports: [server.port] })
@@ -335,27 +395,25 @@ const resolveSessionServer = async (session_id: string, port?: number) => {
   if (port !== undefined) {
     const chosen = servers.find((s) => s.port === port)
     if (!chosen)
-      throw new Error(`no opencode window is listening on port ${port}`)
-    return { server: chosen, otherPorts: [] as number[] }
+      throw new Error(`no opencode server is listening on port ${port}`)
+    return chosen
   }
-  if (servers.length === 0) throw new Error(NO_WINDOWS_MESSAGE)
+  if (servers.length === 0) throw new Error(NO_SERVER_MESSAGE)
 
   const session = (await sessionsByServer(servers)).get(session_id)
   if (!session)
     throw new Error(
-      `session "${session_id}" not found in any opencode window. Use list_sessions to see what's open.`,
+      `session "${session_id}" not found on any opencode server. Use list_sessions to see what's open.`,
     )
-  const [first, ...otherPorts] = session.ports
-  return {
-    server: servers.find((s) => s.port === first) as OpencodeServer,
-    otherPorts,
-  }
+  // v2 servers share one session store, so a session shows on every server.
+  // A task's session stays on its instance, under that instance's guard rails.
+  const owner = readRegistry().find((r) =>
+    r.sessions?.some((s) => s.id === session_id),
+  )
+  const ownerPort =
+    owner && session.ports.includes(owner.port) ? owner.port : session.ports[0]
+  return servers.find((s) => s.port === ownerPort) as OpencodeServer
 }
-
-const otherWindowsNote = (server: OpencodeServer, otherPorts: number[]) =>
-  otherPorts.length
-    ? `\n\n(Sent via the window on port ${server.port}. Windows on ${otherPorts.join(", ")} share this session but won't show it live.)`
-    : ""
 
 export const listSessions = async ({
   directory,
@@ -364,13 +422,13 @@ export const listSessions = async ({
 } = {}) => {
   try {
     const servers = await discoverServers()
-    if (servers.length === 0) return textResult(NO_WINDOWS_MESSAGE)
+    if (servers.length === 0) return textResult(NO_SERVER_MESSAGE)
 
     const lines = [...(await sessionsByServer(servers, directory)).values()]
       .sort((a, b) => b.time.updated - a.time.updated)
       .map(
         (s) =>
-          `${s.id}  ${s.title || "(untitled)"}  ${s.directory}  port ${s.ports.join(", ")}  updated ${new Date(s.time.updated).toISOString()}`,
+          `${s.id}  ${s.title || "(untitled)"}  ${s.location.directory}  port ${s.ports.join(", ")}  updated ${new Date(s.time.updated).toISOString()}`,
       )
     return textResult(lines.join("\n") || "No sessions found")
   } catch (e) {
@@ -399,43 +457,52 @@ export const send = async ({
     )
 
   try {
-    const { server, otherPorts } = await resolveSessionServer(session_id, port)
-    const [providerID, modelID] = (model?.split("/") ?? []) as [string, string]
-    const reply = getClient(server.url).session.prompt({
+    const client = getClient(await resolveSessionServer(session_id, port))
+    // v2 prompts carry no agent or model: both are switched on the session,
+    // which keeps them for later turns, as picking them in the TUI does.
+    if (agent)
+      await client.session.switchAgent({ sessionID: session_id, agent })
+    if (model)
+      await client.session.switchModel({
+        sessionID: session_id,
+        model: toModelRef(model),
+      })
+    const sent = await client.session.prompt({
       sessionID: session_id,
-      parts: [{ type: "text", text: prompt }],
-      ...(agent && { agent }),
-      ...(model && { model: { providerID, modelID } }),
+      text: prompt,
     })
 
-    let timer: NodeJS.Timeout | undefined
-    const timedOut = new Promise<"timeout">((resolve) => {
-      timer = setTimeout(() => resolve("timeout"), timeout_seconds * 1000)
-    })
-    const response = await Promise.race([reply, timedOut]).finally(() =>
-      clearTimeout(timer),
+    const { status, newestFirst } = await settleRun(
+      client,
+      session_id,
+      Date.now() + timeout_seconds * 1000,
     )
-
-    if (response === "timeout")
+    if (status === "busy" || status === "retry")
       return textResult(
         `Still running after ${timeout_seconds}s — opencode keeps working on it. Use read with session_id "${session_id}" later to get the reply.`,
       )
-
-    const info = response.data?.info
-    if (info?.error) {
-      const error = info.error as { data?: { message?: string }; name?: string }
+    if (status === "error")
       return textResult(
-        `Error: ${error.data?.message ?? error.name ?? "unknown provider error"}`,
+        `Error: ${runError(newestFirst)?.message ?? "unknown provider error"}`,
       )
-    }
 
-    const text = condenseParts((response.data?.parts ?? []) as SessionPart[])
-    return textResult(
-      text ? text + otherWindowsNote(server, otherPorts) : "Error: no response",
-    )
+    const text = repliesTo(newestFirst, sent.id)
+      .map(condenseAssistant)
+      .filter(Boolean)
+      .join("\n")
+    return textResult(text || "Error: no response")
   } catch (e) {
     return errorResult(e)
   }
+}
+
+const transcriptEntry = (message: SessionMessageInfo) => {
+  if (message.type === "user") return `── user ──\n${message.text.trim()}`
+  if (isAssistant(message)) {
+    const body = condenseAssistant(message)
+    return body ? `── assistant ──\n${body}` : ""
+  }
+  return ""
 }
 
 export const read = async ({
@@ -448,16 +515,15 @@ export const read = async ({
   port?: number
 }) => {
   try {
-    const { server } = await resolveSessionServer(session_id, port)
-    const response = await getClient(server.url).session.messages({
+    const client = getClient(await resolveSessionServer(session_id, port))
+    const { data } = await client.message.list({
       sessionID: session_id,
+      order: "desc",
       limit,
     })
-    const transcript = (response.data ?? [])
-      .map(({ info, parts }) => {
-        const body = condenseParts(parts as SessionPart[])
-        return body ? `── ${info.role} ──\n${body}` : ""
-      })
+    const transcript = [...data]
+      .reverse()
+      .map(transcriptEntry)
       .filter(Boolean)
       .join("\n\n")
     return textResult(transcript || "No messages in this session")
@@ -478,66 +544,81 @@ const STATE_DIR =
   process.env.MCP_OPENCODE_STATE_DIR ??
   join(homedir(), ".local", "state", "mcp-opencode")
 const REGISTRY_PATH = join(STATE_DIR, "instances.json")
-const LISTENING_LINE = /opencode server listening on http:\/\/[^\s:]+:(\d+)/
+const LISTENING_LINE = /server listening on http:\/\/[^\s:]+:(\d+)/i
 
-const BASH_DENY_PATTERNS = [
-  "git push*",
-  "git remote*",
+// Globs match the whole command, so a leading and inner * also catch
+// `git -C <dir> push`, `env X=1 git push` and `cd x && git push`. The
+// cost is the odd false positive (a commit message saying " push"), which
+// fails safe.
+const SHELL_DENY_PATTERNS = [
+  "*git* push*",
+  "*git* remote*",
+  "*git* reset*--hard*",
   "gh *",
-  "npm publish*",
-  "git reset --hard*",
+  "* gh *",
+  "*npm* publish*",
 ]
 
-const ruleFor = (
-  permission: string,
-  action: "allow" | "deny",
-  pattern = "*",
-) => ({ permission, pattern, action })
+const rule = (
+  action: string,
+  effect: "allow" | "deny",
+  resource = "*",
+): PermissionRule => ({ action, resource, effect })
 
-// opencode evaluates rules with findLast: the last matching rule wins, and no
-// match means "ask", which would hang a headless session forever. So every
-// rule here is allow or deny, and the bash denies come after the bash allow.
-export const HEADLESS_PERMISSION_RULESET: PermissionRuleset = [
-  ...["read", "edit", "glob", "grep", "list", "todowrite", "task"].map((p) =>
-    ruleFor(p, "allow"),
+// opencode v2 evaluates rules in order and the last match wins; agents start
+// from a base policy that allows everything, and their own rules land after
+// these. Every rule here is allow or deny, never ask, which would hang a
+// headless session, and the shell denies come after the shell allow.
+export const HEADLESS_PERMISSION_RULESET: PermissionRule[] = [
+  ...["read", "edit", "glob", "grep", "subagent"].map((action) =>
+    rule(action, "allow"),
   ),
-  ...["external_directory", "question", "doom_loop", "webfetch"].map((p) =>
-    ruleFor(p, "deny"),
+  // v2 allows external_directory by default; keep it denied.
+  ...["external_directory", "question", "webfetch", "websearch"].map((action) =>
+    rule(action, "deny"),
   ),
-  ruleFor("bash", "allow"),
-  ...BASH_DENY_PATTERNS.map((pattern) => ruleFor("bash", "deny", pattern)),
+  rule("shell", "allow"),
+  ...SHELL_DENY_PATTERNS.map((pattern) => rule("shell", "deny", pattern)),
 ]
 
-// The same rules in opencode's config shape, so they also govern every agent
-// in the instance, including task subagents, which only inherit denies.
-const rulesetAsConfig = (ruleset: PermissionRuleset) => {
-  const grouped = new Map<string, Record<string, string>>()
-  for (const { permission, pattern, action } of ruleset)
-    grouped.set(permission, {
-      ...grouped.get(permission),
-      [pattern]: action,
-    })
-  return Object.fromEntries(
-    [...grouped].map(([permission, patterns]) => {
-      const keys = Object.keys(patterns)
-      return [
-        permission,
-        keys.length === 1 && keys[0] === "*" ? patterns["*"] : patterns,
-      ]
-    }),
-  )
+const rulesetFor = (sandboxed: boolean) =>
+  sandboxed
+    ? [...HEADLESS_PERMISSION_RULESET, ...sandboxShellDenyRules()]
+    : HEADLESS_PERMISSION_RULESET
+
+// Policies run after every permission rule, agent and project config
+// included, and can only deny: each deny is repeated there so a repository's
+// own opencode config cannot allow it back.
+const denyPolicies = (ruleset: PermissionRule[]) =>
+  ruleset
+    .filter((r) => r.effect === "deny")
+    .map((r) => ({
+      action: "tool.use" as const,
+      resource: `${r.action}:${r.resource}`,
+      effect: "deny" as const,
+    }))
+
+export const instanceConfig = (sandboxed = false) => {
+  const ruleset = rulesetFor(sandboxed)
+  return {
+    model: DEFAULT_MODEL,
+    agents: { title: { model: DEFAULT_MODEL } },
+    permissions: ruleset,
+    policies: denyPolicies(ruleset),
+  }
 }
 
 export const hardenedInstance = (
   baseEnv: NodeJS.ProcessEnv = process.env,
-  opts: { sandboxed?: boolean } = {},
+  opts: { sandboxed?: boolean; password?: string } = {},
 ): NodeJS.ProcessEnv => {
-  const { GH_TOKEN, GITHUB_TOKEN, ...env } = baseEnv
-  // Sandboxed instances extend (never replace) the base ruleset, so the
-  // model pinning and guard rails stay identical and only gain denies.
-  const ruleset = opts.sandboxed
-    ? [...HEADLESS_PERMISSION_RULESET, ...sandboxBashDenyEntries()]
-    : HEADLESS_PERMISSION_RULESET
+  const {
+    GH_TOKEN,
+    GITHUB_TOKEN,
+    OPENCODE_PASSWORD,
+    OPENCODE_SERVER_PASSWORD,
+    ...env
+  } = baseEnv
   return {
     ...env,
     GIT_TERMINAL_PROMPT: "0",
@@ -545,11 +626,13 @@ export const hardenedInstance = (
     GIT_CONFIG_COUNT: "1",
     GIT_CONFIG_KEY_0: "credential.helper",
     GIT_CONFIG_VALUE_0: "",
-    OPENCODE_CONFIG_CONTENT: JSON.stringify({
-      model: DEFAULT_MODEL,
-      small_model: DEFAULT_MODEL,
-      permission: rulesetAsConfig(ruleset),
-    }),
+    OPENCODE_DISABLE_AUTOUPDATE: "1",
+    ...(opts.password && { OPENCODE_PASSWORD: opts.password }),
+    // Sandboxed instances extend (never replace) the base ruleset, so the
+    // model pinning and guard rails stay identical and only gain denies.
+    OPENCODE_CONFIG_CONTENT: JSON.stringify(
+      instanceConfig(opts.sandboxed ?? false),
+    ),
   }
 }
 
@@ -633,26 +716,24 @@ const updateRegistrySession = (
   )
 }
 
-const PROVIDER_ERROR_NAMES = new Set(["APIError", "ProviderAuthError"])
-
+// opencode v2 types provider failures as "provider.*" (e.g.
+// provider.no-route for a model the provider does not serve).
 export const isProviderError = (error?: {
-  name?: string
-  data?: { message?: string }
+  type?: string
+  message?: string
 }) => {
   if (!error) return false
-  if (error.name && PROVIDER_ERROR_NAMES.has(error.name)) return true
-  return /model not found/i.test(String(error.data?.message ?? ""))
+  if (error.type?.startsWith("provider.")) return true
+  return /model not found/i.test(String(error.message ?? ""))
 }
 
-const providerErrorReason = (error: {
-  name?: string
-  data?: { message?: string }
-}) =>
-  `provider error (${error.name ?? "error"}: ${error.data?.message ?? error.name ?? "unknown provider error"})`
+const providerErrorReason = (error: SessionStructuredError) =>
+  `provider error (${error.type}: ${error.message})`
 
 const switchJobModel = async (job: JobState, reason: string) => {
   const from = job.models[job.index]
   const next = job.models[job.index + 1]
+  const instance = findInstance(job.port)
   if (!next) {
     job.settled = true
     job.exhaustedError = true
@@ -661,44 +742,39 @@ const switchJobModel = async (job: JobState, reason: string) => {
       job.timer = undefined
     }
     try {
-      const instance = findInstance(job.port)
-      if (instance) {
-        await getClient(
-          instanceUrl(job.port),
-          instance.directory,
-        ).session.abort({
+      if (instance)
+        await getClient(instanceServer(instance)).session.interrupt({
           sessionID: job.sessionId,
-          directory: instance.directory,
         })
-      }
     } catch {}
     return
   }
-  const instance = findInstance(job.port)
   if (!instance) {
     job.settled = true
     if (job.timer) clearInterval(job.timer)
     jobs.delete(jobKey(job.port, job.sessionId))
     return
   }
-  const client = getClient(instanceUrl(job.port), instance.directory)
+  const client = getClient(instanceServer(instance))
   try {
-    await client.session
-      .abort({ sessionID: job.sessionId, directory: instance.directory })
-      .catch(() => {})
-    const [providerID, modelID] = next.split("/") as [string, string]
-    await client.session.promptAsync({
+    await client.session.interrupt({ sessionID: job.sessionId }).catch(() => {})
+    await client.session.switchModel({
       sessionID: job.sessionId,
-      directory: instance.directory,
-      agent: job.agent,
-      model: { providerID, modelID },
-      parts: [{ type: "text", text: job.prompt }],
+      model: toModelRef(next),
     })
+    await client.session.prompt({ sessionID: job.sessionId, text: job.prompt })
   } catch {}
   job.index += 1
   job.retrySince = undefined
   job.fallbacks.push({ from, to: next, reason, at: new Date().toISOString() })
   updateRegistrySession(job.port, job.sessionId, next, [...job.fallbacks])
+}
+
+const settledProviderError = (newestFirst: SessionMessageInfo[]) => {
+  const error = runError(newestFirst)
+  return newestFirst[0]?.type === "idle" && isProviderError(error)
+    ? error
+    : undefined
 }
 
 const checkJob = async (key: string) => {
@@ -711,46 +787,24 @@ const checkJob = async (key: string) => {
       clearJob(job)
       return
     }
-    const client = getClient(instanceUrl(job.port), instance.directory)
-    const [statusRes, msgRes] = await Promise.all([
-      client.session.status({ directory: instance.directory }),
-      client.session.messages({
-        sessionID: job.sessionId,
-        directory: instance.directory,
-      }),
-    ])
-    const live = (
-      (statusRes.data ?? {}) as Record<
-        string,
-        { type: SessionStatusType; attempt?: number; message?: string }
-      >
-    )[job.sessionId]
-    const entries = (msgRes.data ?? []) as MessageEntry[]
-    const last = entries.at(-1)
-    if (
-      last?.info.role === "assistant" &&
-      last.info.error &&
-      isProviderError(
-        last.info.error as { name?: string; data?: { message?: string } },
-      )
-    ) {
-      await switchJobModel(
-        job,
-        providerErrorReason(
-          last.info.error as { name?: string; data?: { message?: string } },
-        ),
-      )
+    const client = getClient(instanceServer(instance))
+    const { newestFirst, status } = await runSnapshot(client, job.sessionId)
+    const providerError = settledProviderError(newestFirst)
+    if (providerError) {
+      await switchJobModel(job, providerErrorReason(providerError))
       return
     }
-    if (live?.type === "retry") {
+    if (status === "retry") {
       if (job.retrySince === undefined) {
         job.retrySince = Date.now()
       } else if (
         Date.now() - job.retrySince >=
         getRetryTimeoutSeconds() * 1000
       ) {
-        const detail = live.message
-          ? ` (attempt ${live.attempt ?? "?"}: ${live.message})`
+        const newest = newestFirst[0]
+        const retry = newest && isAssistant(newest) ? newest.retry : undefined
+        const detail = retry
+          ? ` (attempt ${retry.attempt}: ${retry.error.message})`
           : ""
         await switchJobModel(
           job,
@@ -759,9 +813,7 @@ const checkJob = async (key: string) => {
       }
     } else {
       job.retrySince = undefined
-      const settled =
-        !live || live.type === "idle" ? settledOutcome(entries) : undefined
-      if (settled) {
+      if (status === "idle" || status === "error") {
         job.settled = true
         if (job.timer) {
           clearInterval(job.timer)
@@ -795,6 +847,9 @@ export type InstanceRecord = {
   startedAt: string
   mcpPid: number
   sessions: InstanceSessionRecord[]
+  // Basic-auth password (user "opencode") the instance was started with.
+  // The registry is written owner-only (0600) because of it.
+  password?: string
   // "srt" when the server was wrapped in an OS sandbox, null otherwise.
   // Optional so registries written before sandboxing existed still parse.
   sandbox?: SandboxKind | null
@@ -813,6 +868,15 @@ const removeSandboxDir = (dir: string | undefined) => {
 
 const instanceUrl = (port: number) => `http://127.0.0.1:${port}`
 
+const instanceServer = ({
+  port,
+  password,
+}: Pick<InstanceRecord, "port" | "password">): OpencodeServer => ({
+  port,
+  url: instanceUrl(port),
+  ...(password && { password }),
+})
+
 export const readRegistry = (): InstanceRecord[] => {
   try {
     const rows = JSON.parse(readFileSync(REGISTRY_PATH, "utf8"))
@@ -825,7 +889,7 @@ export const readRegistry = (): InstanceRecord[] => {
 const writeRegistry = (rows: InstanceRecord[]) => {
   mkdirSync(STATE_DIR, { recursive: true })
   const tmp = `${REGISTRY_PATH}.${process.pid}.tmp`
-  writeFileSync(tmp, JSON.stringify(rows, null, 2) + "\n")
+  writeFileSync(tmp, JSON.stringify(rows, null, 2) + "\n", { mode: 0o600 })
   renameSync(tmp, REGISTRY_PATH)
 }
 
@@ -847,7 +911,7 @@ const deregisterInstance = (port: number) =>
 const findInstance = (port: number) =>
   readRegistry().find((r) => r.port === port)
 
-const isPidAlive = (pid: number) => {
+function isPidAlive(pid: number) {
   try {
     process.kill(pid, 0)
     return true
@@ -884,24 +948,18 @@ const waitForListeningPort = async (logPath: string, pid: number) => {
   )
 }
 
-type SessionStatusType = "idle" | "busy" | "retry"
-
-const instanceSessions = async ({ port, directory }: InstanceRecord) => {
-  const client = getClient(instanceUrl(port), directory)
-  const [sessions, statuses] = await Promise.all([
-    client.session.list({ directory }),
-    client.session.status({ directory }),
+// A private instance holds only its own sessions, so none are filtered out.
+const instanceSessions = async (row: InstanceRecord) => {
+  const client = getClient(instanceServer(row))
+  const [sessions, active] = await Promise.all([
+    client.session.list({ limit: RECENT_MESSAGES }),
+    client.session.active(),
   ])
-  if (!sessions.data) throw new Error("session list failed")
-  const statusMap = (statuses.data ?? {}) as Record<
-    string,
-    { type: SessionStatusType }
-  >
   return sessions.data.map((s) => ({
     id: s.id,
-    title: s.title,
+    title: s.title ?? "",
     updated: s.time.updated,
-    status: statusMap[s.id]?.type ?? ("idle" as SessionStatusType),
+    status: active[s.id] ? ("busy" as const) : ("idle" as const),
   }))
 }
 
@@ -967,8 +1025,15 @@ const unknownPortError = (port: number) =>
     `Error: port ${port} is not a registered instance. Use start_instance first, or list_instances to see what's running.`,
   )
 
-const attachCommand = (port: number, sessionId: string) =>
-  `opencode attach ${instanceUrl(port)} --session ${sessionId}`
+// v2 dropped `opencode attach`: the TUI joins a server with --server, and
+// needs the server's password in OPENCODE_PASSWORD.
+export const attachCommand = (row: InstanceRecord, sessionId: string) =>
+  [
+    ...(row.password ? [`OPENCODE_PASSWORD=${row.password}`] : []),
+    `opencode --server ${instanceUrl(row.port)} --session ${sessionId}`,
+  ].join(" ")
+
+const newInstancePassword = () => randomBytes(24).toString("base64url")
 
 export const startInstance = async ({ directory }: { directory: string }) => {
   if (!isModelAllowed(DEFAULT_MODEL))
@@ -1018,13 +1083,17 @@ export const startInstance = async ({ directory }: { directory: string }) => {
       cmd = "srt"
     }
 
+    const password = newInstancePassword()
     const logPath = join(STATE_DIR, `instance-${Date.now()}.log`)
     const logFd = openSync(logPath, "a")
     const child = spawn(cmd, args, {
       cwd: directory,
       detached: true,
       stdio: ["ignore", logFd, logFd],
-      env: hardenedInstance(process.env, { sandboxed: sandbox !== null }),
+      env: hardenedInstance(process.env, {
+        sandboxed: sandbox !== null,
+        password,
+      }),
     })
     closeSync(logFd)
     child.unref()
@@ -1050,6 +1119,7 @@ export const startInstance = async ({ directory }: { directory: string }) => {
       startedAt: new Date().toISOString(),
       mcpPid: process.pid,
       sessions: [],
+      password,
       sandbox: sandbox ? "srt" : null,
       ...(sandboxSettingsDir && { sandboxSettingsDir }),
     })
@@ -1082,33 +1152,25 @@ export const task = async ({
     )
 
   try {
-    const client = getClient(instanceUrl(port), instance.directory)
-    // Sandboxed instances get the same extra bash denies as their
+    const client = getClient(instanceServer(instance))
+    // Sandboxed instances get the same extra shell denies as their
     // OPENCODE_CONFIG_CONTENT, so the session and the server agree.
-    const permission =
-      instance.sandbox === "srt"
-        ? [...HEADLESS_PERMISSION_RULESET, ...sandboxBashDenyEntries()]
-        : HEADLESS_PERMISSION_RULESET
     const created = await client.session.create({
-      directory: instance.directory,
-      permission,
+      location: { directory: instance.directory },
+      agent,
+      model: toModelRef(chosenModel),
+      permissions: rulesetFor(instance.sandbox === "srt"),
       ...(title && { title }),
     })
-    const sessionId = created.data?.id
-    if (!sessionId) return textResult("Error: failed to create session")
+    const sessionId = created.id
 
-    const [providerID, modelID] = chosenModel.split("/") as [string, string]
-    const sent = await client.session.promptAsync({
-      sessionID: sessionId,
-      directory: instance.directory,
-      agent,
-      model: { providerID, modelID },
-      parts: [{ type: "text", text: prompt }],
-    })
-    if (sent.error)
+    try {
+      await client.session.prompt({ sessionID: sessionId, text: prompt })
+    } catch (e) {
       return textResult(
-        `Error: prompt was not accepted: ${JSON.stringify(sent.error)}`,
+        `Error: prompt was not accepted: ${e instanceof Error ? e.message : String(e)}`,
       )
+    }
 
     const models = [chosenModel, ...getFallbackModels()].filter(
       (m, i, all) => all.indexOf(m) === i,
@@ -1116,7 +1178,7 @@ export const task = async ({
 
     recordInstanceSession(port, {
       id: sessionId,
-      title: created.data?.title ?? title ?? "",
+      title: created.title ?? title ?? "",
       model: chosenModel,
       startedAt: new Date().toISOString(),
       fallbacks: [],
@@ -1143,40 +1205,18 @@ export const task = async ({
     return jsonResult({
       session_id: sessionId,
       port,
-      attach: attachCommand(port, sessionId),
+      attach: attachCommand(instance, sessionId),
     })
   } catch (e) {
     return errorResult(e)
   }
 }
 
-type MessageEntry = {
-  info: {
-    id?: string
-    role: string
-    error?: { name?: string; data?: { message?: string } }
-    time?: { completed?: number }
-  }
-  parts: SessionPart[]
-}
-
-const settledOutcome = (messages: MessageEntry[]) => {
-  const last = messages.at(-1)
-  if (!last || last.info.role !== "assistant") return undefined
-  if (last.info.error) return "error" as const
-  return last.info.time?.completed ? ("idle" as const) : undefined
-}
-
-const lastAssistantText = (messages: MessageEntry[]) => {
-  const last = messages.findLast((m) => m.info.role === "assistant")
-  if (!last) return ""
-  if (last.info.error)
-    return `Error: ${last.info.error.data?.message ?? last.info.error.name ?? "unknown error"}`
-  return last.parts
-    .filter((p) => p.type === "text")
-    .map((p) => String(p.text ?? "").trim())
-    .filter(Boolean)
-    .join("\n")
+const lastAssistantText = (newestFirst: SessionMessageInfo[]) => {
+  const error = runError(newestFirst)
+  if (error) return `Error: ${error.message}`
+  const last = newestFirst.find(isAssistant)
+  return last ? assistantText(last) : ""
 }
 
 export const wait = async ({
@@ -1190,28 +1230,13 @@ export const wait = async ({
 }) => {
   const instance = findInstance(port)
   if (!instance) return unknownPortError(port)
-  const { directory } = instance
-  const client = getClient(instanceUrl(port), directory)
+  const client = getClient(instanceServer(instance))
   const deadline =
     Date.now() + Math.min(timeout_seconds, MAX_WAIT_SECONDS) * 1000
 
   try {
     const key = jobKey(port, session_id)
-    const snapshot = async () => {
-      const [statuses, messages] = await Promise.all([
-        client.session.status({ directory }),
-        client.session.messages({ sessionID: session_id, directory }),
-      ])
-      const entries = (messages.data ?? []) as MessageEntry[]
-      const live = (
-        (statuses.data ?? {}) as Record<string, { type: SessionStatusType }>
-      )[session_id]?.type
-      const settled =
-        live && live !== "idle" ? undefined : settledOutcome(entries)
-      const status =
-        settled ?? (live === "retry" ? ("retry" as const) : ("busy" as const))
-      return { entries, status }
-    }
+    const snapshot = () => runSnapshot(client, session_id)
 
     const jobReport = () => {
       const job = jobs.get(key)
@@ -1228,22 +1253,18 @@ export const wait = async ({
     let current = await snapshot()
     while (Date.now() < deadline) {
       const job = jobs.get(key)
-      if (current.status === "error" && job && !job.exhaustedError) {
-        const last = current.entries.at(-1)
-        if (
-          last?.info.role === "assistant" &&
-          last.info.error &&
-          isProviderError(
-            last.info.error as { name?: string; data?: { message?: string } },
-          )
-        ) {
-          await checkJob(key)
+      if (
+        current.status === "error" &&
+        job &&
+        !job.exhaustedError &&
+        settledProviderError(current.newestFirst)
+      ) {
+        await checkJob(key)
+        current = await snapshot()
+        if (current.status === "busy" || current.status === "retry") {
+          await sleep(Math.min(WAIT_POLL_INTERVAL_MS, deadline - Date.now()))
           current = await snapshot()
-          if (current.status === "busy" || current.status === "retry") {
-            await sleep(Math.min(WAIT_POLL_INTERVAL_MS, deadline - Date.now()))
-            current = await snapshot()
-            continue
-          }
+          continue
         }
       }
       if (current.status !== "busy" && current.status !== "retry") break
@@ -1255,18 +1276,10 @@ export const wait = async ({
     if (finalJob?.exhaustedError && current.status !== "idle")
       current = { ...current, status: "error" as const }
 
-    // opencode keeps diffs per user message; the first prompt is this job's
-    // baseline, so fallbacks re-prompting the same session don't re-base it.
-    const promptId = current.entries.find((m) => m.info.role === "user")?.info
-      .id
-    const diff = promptId
-      ? await client.session.diff({
-          sessionID: session_id,
-          directory,
-          messageID: promptId,
-        })
-      : { data: [] }
-    const files = (diff.data ?? []).map((d) => ({
+    // Without bounds, a v2 session diff spans the whole session, so model
+    // fallbacks re-prompting the same session don't re-base it.
+    const diff = await client.session.diff({ sessionID: session_id })
+    const files = diff.map((d) => ({
       file: d.file,
       status: d.status,
       additions: d.additions,
@@ -1278,9 +1291,9 @@ export const wait = async ({
       status: current.status,
       ...jobReport(),
       ...((current.status === "busy" || current.status === "retry") && {
-        note: `Still running at the timeout. Call wait again, or attach: ${attachCommand(port, session_id)}`,
+        note: `Still running at the timeout. Call wait again, or attach: ${attachCommand(instance, session_id)}`,
       }),
-      last_assistant_text: lastAssistantText(current.entries),
+      last_assistant_text: lastAssistantText(current.newestFirst),
       files,
     })
   } catch (e) {
@@ -1292,12 +1305,15 @@ export const listInstances = async () => {
   try {
     await reapInstances()
     const rows = await Promise.all(
-      readRegistry().map(async (row) => {
+      readRegistry().map(async ({ password, ...row }) => {
         // Registries written before sandboxing existed lack the field.
         const sandbox = row.sandbox ?? null
         try {
           const live = new Map(
-            (await instanceSessions(row)).map((s) => [s.id, s]),
+            (await instanceSessions({ ...row, password })).map((s) => [
+              s.id,
+              s,
+            ]),
           )
           return {
             ...row,
@@ -1324,10 +1340,20 @@ export const listInstances = async () => {
   }
 }
 
+// Any HTTP answer, even a 401, means the port is still open.
+const isListening = async (url: string) => {
+  try {
+    await fetch(url, { signal: AbortSignal.timeout(PROBE_TIMEOUT_MS) })
+    return true
+  } catch {
+    return false
+  }
+}
+
 const waitForPortToClose = async (port: number) => {
   const deadline = Date.now() + INSTANCE_STOP_TIMEOUT_MS
   while (Date.now() < deadline) {
-    if (!(await answersAsOpencode(instanceUrl(port)))) return true
+    if (!(await isListening(instanceUrl(port)))) return true
     await sleep(READY_POLL_INTERVAL_MS)
   }
   return false
@@ -1340,13 +1366,10 @@ export const stopInstance = async ({ port }: { port: number }) => {
   try {
     const aborted: string[] = []
     try {
-      const client = getClient(instanceUrl(port), instance.directory)
+      const client = getClient(instanceServer(instance))
       for (const s of await instanceSessions(instance)) {
         if (s.status === "idle") continue
-        await client.session.abort({
-          sessionID: s.id,
-          directory: instance.directory,
-        })
+        await client.session.interrupt({ sessionID: s.id })
         aborted.push(s.id)
       }
     } catch {
@@ -1422,7 +1445,7 @@ server.registerTool(
 server.registerTool(
   "list_sessions",
   {
-    description: `List sessions across every open opencode window (discovered automatically; only windows started with --port are visible), most recently updated first, with the port(s) each is open on. Use this to find a live session to talk to with send.`,
+    description: `List sessions on opencode's background service (shared by every TUI window) and on the headless instances from start_instance, most recently updated first, with the port(s) each is served on. Use this to find a live session to talk to with send.`,
     inputSchema: {
       directory: z
         .string()
@@ -1436,7 +1459,7 @@ server.registerTool(
 server.registerTool(
   "send",
   {
-    description: `Send a message to an existing opencode session and return its reply. The session keeps its history and model, and the exchange appears live in any attached opencode TUI. Never creates or deletes sessions. Uses the session's own model unless \`model\` is passed, which must pass the allow/block filters (${filterSummary}).`,
+    description: `Send a message to an existing opencode session and return its reply. The session keeps its history and model, and the exchange appears live in any opencode TUI showing it. Never creates or deletes sessions. Uses the session's own agent and model unless \`agent\` or \`model\` is passed; either switches the session for later turns too, as picking it in the TUI does. The model must pass the allow/block filters (${filterSummary}).`,
     inputSchema: {
       session_id: z.string().describe("Session ID from list_sessions"),
       prompt: z.string().describe("The message to send"),
@@ -1457,7 +1480,7 @@ server.registerTool(
         .int()
         .optional()
         .describe(
-          "Port of the opencode window to use (default: the window that owns the session; lowest port if several)",
+          "Port of the opencode server to use (default: the server that holds the session)",
         ),
       timeout_seconds: z
         .number()
@@ -1489,7 +1512,7 @@ server.registerTool(
         .int()
         .optional()
         .describe(
-          "Port of the opencode window to read from (default: discovered)",
+          "Port of the opencode server to read from (default: discovered)",
         ),
     },
   },
@@ -1499,7 +1522,7 @@ server.registerTool(
 server.registerTool(
   "start_instance",
   {
-    description: `Start a private, headless opencode server for one job, rooted in \`directory\`. It listens on a free localhost port, runs with git credentials and GitHub tokens stripped, and pins its model to ${DEFAULT_MODEL}. Returns { port, url }. Idle instances are reaped after ${INSTANCE_TTL_MS / 60000} minutes; use stop_instance when done. Set MCP_OPENCODE_SANDBOX=srt to wrap the server in an OS sandbox (needs \`srt\` on PATH).`,
+    description: `Start a private, headless opencode server for one job, rooted in \`directory\`. It listens on a free localhost port behind a generated password, runs with git credentials and GitHub tokens stripped, and pins its model to ${DEFAULT_MODEL}. Returns { port, url }. Idle instances are reaped after ${INSTANCE_TTL_MS / 60000} minutes; use stop_instance when done. Set MCP_OPENCODE_SANDBOX=srt to wrap the server in an OS sandbox (needs \`srt\` on PATH).`,
     inputSchema: {
       directory: z
         .string()
@@ -1512,7 +1535,7 @@ server.registerTool(
 server.registerTool(
   "task",
   {
-    description: `Start a job on an instance from start_instance: creates a fresh session with the headless guard rails (no permission prompts; bash allowed except git push/remote, gh, npm publish and git reset --hard; no web fetch, no questions, nothing outside the directory) and prompts it in the background. Returns { session_id, port, attach } at once; use wait to collect the result. Model must pass the allow/block filters (${filterSummary}).`,
+    description: `Start a job on an instance from start_instance: creates a fresh session with the headless guard rails (no permission prompts; bash allowed except git push/remote, gh, npm publish and git reset --hard; no web fetch or search, no questions, nothing outside the directory) and prompts it in the background. Returns { session_id, port, attach } at once (attach is the command that opens the session in the TUI); use wait to collect the result. Model must pass the allow/block filters (${filterSummary}).`,
     inputSchema: {
       port: z.number().int().describe("Port returned by start_instance"),
       prompt: z.string().describe("What the job should do"),

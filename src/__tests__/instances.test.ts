@@ -13,6 +13,7 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  statSync,
   writeFileSync,
   writeSync,
 } from "fs"
@@ -25,6 +26,8 @@ const stateDir = vi.hoisted(() => {
   process.env.MCP_OPENCODE_MODEL_BLOCK = ""
   process.env.MCP_OPENCODE_INSTANCE_TTL = "60"
   delete process.env.MCP_OPENCODE_MODEL
+  delete process.env.MCP_OPENCODE_SANDBOX
+  delete process.env.MCP_OPENCODE_SANDBOX_SETTINGS
   return dir
 })
 
@@ -33,14 +36,19 @@ vi.mock("child_process", () => ({
   spawn: vi.fn(),
 }))
 
-vi.mock("@opencode-ai/sdk/v2/client", () => ({
-  createOpencodeClient: vi.fn(),
+vi.mock("@opencode/client", () => ({
+  OpenCode: { make: vi.fn() },
+}))
+
+vi.mock("@opencode/client/service", () => ({
+  Service: { discover: vi.fn(), ensure: vi.fn() },
 }))
 
 import { execSync, spawn } from "child_process"
-import { createOpencodeClient } from "@opencode-ai/sdk/v2/client"
+import { OpenCode } from "@opencode/client"
 import {
   HEADLESS_PERMISSION_RULESET,
+  attachCommand,
   hardenedInstance,
   listInstances,
   parseListeningPort,
@@ -52,30 +60,22 @@ import {
   wait,
   type InstanceRecord,
 } from "../index.js"
+import {
+  assistantMessage,
+  FIXTURE_AUTH,
+  history,
+  idleMessage,
+  makeClient,
+  userMessage,
+} from "./fake-client.js"
 
 const mockExecSync = vi.mocked(execSync)
 const mockSpawn = vi.mocked(spawn)
-const mockCreateClient = vi.mocked(createOpencodeClient)
+const mockMakeClient = vi.mocked(OpenCode.make)
 const registryPath = join(stateDir, "instances.json")
 
 const LIVE_PID = 4242
 const DEAD_PID = 4343
-
-const makeClient = (overrides: Record<string, unknown> = {}) =>
-  ({
-    session: {
-      create: vi
-        .fn()
-        .mockResolvedValue({ data: { id: "ses_1", title: "New session" } }),
-      promptAsync: vi.fn().mockResolvedValue({ data: undefined }),
-      list: vi.fn().mockResolvedValue({ data: [] }),
-      status: vi.fn().mockResolvedValue({ data: {} }),
-      messages: vi.fn().mockResolvedValue({ data: [] }),
-      diff: vi.fn().mockResolvedValue({ data: [] }),
-      abort: vi.fn().mockResolvedValue({ data: true }),
-      ...overrides,
-    },
-  }) as unknown as ReturnType<typeof createOpencodeClient>
 
 const row = (overrides: Partial<InstanceRecord> = {}): InstanceRecord => ({
   runtime: "opencode",
@@ -85,6 +85,7 @@ const row = (overrides: Partial<InstanceRecord> = {}): InstanceRecord => ({
   startedAt: new Date(Date.now() - 10 * 60_000).toISOString(),
   mcpPid: 1,
   sessions: [],
+  password: FIXTURE_AUTH.instance,
   ...overrides,
 })
 
@@ -93,26 +94,31 @@ const seedRegistry = (rows: InstanceRecord[]) => {
   writeFileSync(registryPath, JSON.stringify(rows))
 }
 
-// opencode resolves a permission with `rules.findLast(match) ?? ask`.
+const useClient = (client: ReturnType<typeof makeClient>) =>
+  mockMakeClient.mockReturnValue(client as never)
+
+// opencode v2 resolves a permission with the last matching rule, after an
+// agent base policy that allows everything.
 const wildcard = (pattern: string) =>
   new RegExp(
     "^" +
       pattern.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*") +
       "$",
   )
-const evaluate = (permission: string, input: string) =>
-  HEADLESS_PERMISSION_RULESET.findLast(
-    (r) =>
-      wildcard(r.permission).test(permission) &&
-      wildcard(r.pattern).test(input),
-  )?.action ?? "ask"
+const evaluate = (action: string, input: string) =>
+  [
+    { action: "*", resource: "*", effect: "allow" },
+    ...HEADLESS_PERMISSION_RULESET,
+  ].findLast(
+    (r) => wildcard(r.action).test(action) && wildcard(r.resource).test(input),
+  )?.effect ?? "ask"
 
 let killSpy: MockInstance<typeof process.kill>
 
 beforeEach(() => {
   vi.clearAllMocks()
   seedRegistry([])
-  mockCreateClient.mockReturnValue(makeClient())
+  useClient(makeClient())
   mockExecSync.mockReturnValue(Buffer.from("opencode serve"))
   killSpy = vi.spyOn(process, "kill").mockImplementation(((
     pid: number,
@@ -154,9 +160,7 @@ const spawnThatPrints = (output: string) =>
 describe("parseListeningPort", () => {
   it("reads the port from opencode's listening line", () => {
     expect(
-      parseListeningPort(
-        "Warning: OPENCODE_SERVER_PASSWORD is not set\nopencode server listening on http://127.0.0.1:53817\n",
-      ),
+      parseListeningPort("server listening on http://127.0.0.1:53817\n"),
     ).toBe(53817)
   })
 
@@ -167,7 +171,7 @@ describe("parseListeningPort", () => {
 
 describe("startInstance", () => {
   it("spawns a detached hardened server on port 0 and registers it", async () => {
-    spawnThatPrints("opencode server listening on http://127.0.0.1:53817\n")
+    spawnThatPrints("server listening on http://127.0.0.1:53817\n")
     const directory = mkdtempSync(join(stateDir, "proj-"))
 
     const result = await startInstance({ directory })
@@ -187,7 +191,8 @@ describe("startInstance", () => {
     expect(options.detached).toBe(true)
     expect(options.env.GIT_TERMINAL_PROMPT).toBe("0")
     expect(options.env.GIT_SSH_COMMAND).toBe("false")
-    expect(readRegistry()).toEqual([
+    const [registered] = readRegistry()
+    expect(registered).toEqual(
       expect.objectContaining({
         runtime: "opencode",
         pid: LIVE_PID,
@@ -196,7 +201,10 @@ describe("startInstance", () => {
         mcpPid: process.pid,
         sessions: [],
       }),
-    ])
+    )
+    expect(registered.password).toBe(options.env.OPENCODE_PASSWORD)
+    expect(registered.password?.length).toBeGreaterThanOrEqual(32)
+    expect(statSync(registryPath).mode & 0o777).toBe(0o600)
   })
 
   it("times out and kills the server when no listening line appears", async () => {
@@ -223,15 +231,22 @@ describe("startInstance", () => {
 })
 
 describe("hardenedInstance", () => {
-  it("strips GitHub tokens, disables git credentials and pins the model", () => {
-    const env = hardenedInstance({
-      PATH: "/usr/bin",
-      GH_TOKEN: "x",
-      GITHUB_TOKEN: "y",
-    })
+  it("strips GitHub tokens and inherited passwords, disables git credentials", () => {
+    const env = hardenedInstance(
+      {
+        PATH: "/usr/bin",
+        GH_TOKEN: "x",
+        GITHUB_TOKEN: "y",
+        OPENCODE_PASSWORD: FIXTURE_AUTH.inherited,
+        OPENCODE_SERVER_PASSWORD: FIXTURE_AUTH.inherited,
+      },
+      { password: FIXTURE_AUTH.fresh },
+    )
 
     expect(env.GH_TOKEN).toBeUndefined()
     expect(env.GITHUB_TOKEN).toBeUndefined()
+    expect(env.OPENCODE_SERVER_PASSWORD).toBeUndefined()
+    expect(env.OPENCODE_PASSWORD).toBe(FIXTURE_AUTH.fresh)
     expect(env.PATH).toBe("/usr/bin")
     expect(env).toMatchObject({
       GIT_TERMINAL_PROMPT: "0",
@@ -239,80 +254,136 @@ describe("hardenedInstance", () => {
       GIT_CONFIG_COUNT: "1",
       GIT_CONFIG_KEY_0: "credential.helper",
       GIT_CONFIG_VALUE_0: "",
+      OPENCODE_DISABLE_AUTOUPDATE: "1",
     })
-    const config = JSON.parse(env.OPENCODE_CONFIG_CONTENT as string)
+  })
+
+  it("injects a native v2 config: model, title agent, permissions, policies", () => {
+    const config = JSON.parse(
+      hardenedInstance({ PATH: "/usr/bin" }).OPENCODE_CONFIG_CONTENT as string,
+    )
+
     expect(config.model).toBe("github-copilot/gpt-4.1")
-    expect(config.small_model).toBe("github-copilot/gpt-4.1")
-    expect(config.permission.bash).toEqual({
-      "*": "allow",
-      "git push*": "deny",
-      "git remote*": "deny",
-      "gh *": "deny",
-      "npm publish*": "deny",
-      "git reset --hard*": "deny",
+    expect(config.agents).toEqual({
+      title: { model: "github-copilot/gpt-4.1" },
     })
-    expect(config.permission.webfetch).toBe("deny")
+    expect(config.small_model).toBeUndefined()
+    expect(config.permission).toBeUndefined()
+    expect(config.permissions).toEqual(HEADLESS_PERMISSION_RULESET)
+    expect(config.policies).toContainEqual({
+      action: "tool.use",
+      resource: "shell:*git* push*",
+      effect: "deny",
+    })
+    expect(config.policies).toContainEqual({
+      action: "tool.use",
+      resource: "webfetch:*",
+      effect: "deny",
+    })
+    expect(
+      config.policies.every(
+        (p: { action: string; effect: string }) =>
+          p.action === "tool.use" && p.effect === "deny",
+      ),
+    ).toBe(true)
   })
 })
 
 describe("HEADLESS_PERMISSION_RULESET", () => {
   it("never asks", () => {
-    expect(HEADLESS_PERMISSION_RULESET.map((r) => r.action)).not.toContain(
+    expect(HEADLESS_PERMISSION_RULESET.map((r) => r.effect)).not.toContain(
       "ask",
     )
   })
 
-  it("lets the later bash denies win over the bash allow", () => {
-    expect(evaluate("bash", "ls -la")).toBe("allow")
-    expect(evaluate("bash", "git commit -m wip")).toBe("allow")
-    expect(evaluate("bash", "git push origin main")).toBe("deny")
-    expect(evaluate("bash", "git remote add x y")).toBe("deny")
-    expect(evaluate("bash", "gh pr create")).toBe("deny")
-    expect(evaluate("bash", "npm publish --access public")).toBe("deny")
-    expect(evaluate("bash", "git reset --hard HEAD~1")).toBe("deny")
+  it("uses v2 action names only", () => {
+    const actions = HEADLESS_PERMISSION_RULESET.map((r) => r.action)
+    for (const v1 of ["bash", "task", "list", "todowrite", "doom_loop"])
+      expect(actions).not.toContain(v1)
+  })
+
+  it("lets the later shell denies win over the shell allow", () => {
+    expect(evaluate("shell", "ls -la")).toBe("allow")
+    expect(evaluate("shell", "git commit -m wip")).toBe("allow")
+    expect(evaluate("shell", "git push origin main")).toBe("deny")
+    expect(evaluate("shell", "git remote add x y")).toBe("deny")
+    expect(evaluate("shell", "gh pr create")).toBe("deny")
+    expect(evaluate("shell", "npm publish --access public")).toBe("deny")
+    expect(evaluate("shell", "git reset --hard HEAD~1")).toBe("deny")
+  })
+
+  it("catches the push and publish forms that dodge a leading glob", () => {
+    for (const command of [
+      "git -C /tmp/project push origin main",
+      "git --git-dir=/tmp/project/.git push",
+      "env GIT_TRACE=1 git push",
+      "cd /tmp/project && git push --force",
+      "/usr/bin/git push",
+      "git -c user.name=x push origin HEAD",
+      "git -C /tmp/project remote add origin x",
+      "git -C /tmp/project reset --hard HEAD~1",
+      "git reset -q --hard",
+      "cd /tmp/project && gh pr create",
+      "npm --prefix /tmp/project publish",
+    ])
+      expect(evaluate("shell", command)).toBe("deny")
+  })
+
+  it("still allows ordinary git and npm work", () => {
+    for (const command of [
+      "git status",
+      "git -C /tmp/project log --oneline",
+      "git add -A",
+      "git reset --soft HEAD~1",
+      "npm test",
+      "npm run build",
+    ])
+      expect(evaluate("shell", command)).toBe("allow")
   })
 
   it("allows the editing tools and denies the escape hatches", () => {
-    for (const p of [
-      "read",
-      "edit",
-      "glob",
-      "grep",
-      "list",
-      "todowrite",
-      "task",
+    for (const action of ["read", "edit", "glob", "grep", "subagent"])
+      expect(evaluate(action, "anything")).toBe("allow")
+    for (const action of [
+      "external_directory",
+      "question",
+      "webfetch",
+      "websearch",
     ])
-      expect(evaluate(p, "anything")).toBe("allow")
-    for (const p of ["external_directory", "question", "doom_loop", "webfetch"])
-      expect(evaluate(p, "anything")).toBe("deny")
+      expect(evaluate(action, "anything")).toBe("deny")
   })
 })
 
 describe("task", () => {
-  it("creates a guarded session, prompts it async and records it", async () => {
+  it("creates a guarded session in the directory, prompts it and records it", async () => {
     seedRegistry([row()])
     const client = makeClient()
-    mockCreateClient.mockReturnValue(client)
+    useClient(client)
 
     const result = await task({ port: 51000, prompt: "add a file" })
 
     expect(JSON.parse(result.content[0].text)).toEqual({
       session_id: "ses_1",
       port: 51000,
-      attach: "opencode attach http://127.0.0.1:51000 --session ses_1",
+      attach: `OPENCODE_PASSWORD=${FIXTURE_AUTH.instance} opencode --server http://127.0.0.1:51000 --session ses_1`,
+    })
+    expect(mockMakeClient).toHaveBeenCalledWith({
+      baseUrl: "http://127.0.0.1:51000",
+      headers: {
+        authorization: `Basic ${Buffer.from(`opencode:${FIXTURE_AUTH.instance}`).toString("base64")}`,
+      },
     })
     expect(client.session.create).toHaveBeenCalledWith({
-      directory: "/tmp/project",
-      permission: HEADLESS_PERMISSION_RULESET,
-    })
-    expect(client.session.promptAsync).toHaveBeenCalledWith({
-      sessionID: "ses_1",
-      directory: "/tmp/project",
+      location: { directory: "/tmp/project" },
       agent: "build",
-      model: { providerID: "github-copilot", modelID: "gpt-4.1" },
-      parts: [{ type: "text", text: "add a file" }],
+      model: { providerID: "github-copilot", id: "gpt-4.1" },
+      permissions: HEADLESS_PERMISSION_RULESET,
     })
-    expect(client.session.delete).toBeUndefined()
+    expect(client.session.prompt).toHaveBeenCalledWith({
+      sessionID: "ses_1",
+      text: "add a file",
+    })
+    expect(client.session.remove).not.toHaveBeenCalled()
     expect(readRegistry()[0].sessions).toEqual([
       expect.objectContaining({
         id: "ses_1",
@@ -322,10 +393,23 @@ describe("task", () => {
     ])
   })
 
+  it("reports a prompt the server refused", async () => {
+    seedRegistry([row()])
+    useClient(
+      makeClient({
+        session: { prompt: vi.fn().mockRejectedValue(new Error("409")) },
+      }),
+    )
+
+    const result = await task({ port: 51000, prompt: "hi" })
+
+    expect(result.content[0].text).toBe("Error: prompt was not accepted: 409")
+  })
+
   it("rejects a model outside the allowlist before creating a session", async () => {
     seedRegistry([row()])
     const client = makeClient()
-    mockCreateClient.mockReturnValue(client)
+    useClient(client)
 
     const result = await task({
       port: 51000,
@@ -342,7 +426,15 @@ describe("task", () => {
     expect(result.content[0].text).toContain(
       "port 4096 is not a registered instance",
     )
-    expect(mockCreateClient).not.toHaveBeenCalled()
+    expect(mockMakeClient).not.toHaveBeenCalled()
+  })
+})
+
+describe("attachCommand", () => {
+  it("joins the instance with --server and its password", () => {
+    expect(attachCommand(row({ password: FIXTURE_AUTH.fresh }), "ses_9")).toBe(
+      `OPENCODE_PASSWORD=${FIXTURE_AUTH.fresh} opencode --server http://127.0.0.1:51000 --session ses_9`,
+    )
   })
 })
 
@@ -350,9 +442,14 @@ describe("wait", () => {
   it("returns busy with a note when the timeout elapses", async () => {
     seedRegistry([row()])
     const client = makeClient({
-      status: vi.fn().mockResolvedValue({ data: { ses_1: { type: "busy" } } }),
+      session: {
+        active: vi.fn().mockResolvedValue({ ses_1: { type: "running" } }),
+      },
+      message: {
+        list: vi.fn().mockResolvedValue(history(userMessage("go"))),
+      },
     })
-    mockCreateClient.mockReturnValue(client)
+    useClient(client)
     vi.useFakeTimers()
 
     const pending = wait({
@@ -365,26 +462,26 @@ describe("wait", () => {
 
     expect(result.status).toBe("busy")
     expect(result.note).toContain("Still running")
-    expect(client.session.status).toHaveBeenCalledTimes(4)
+    expect(result.note).toContain("opencode --server http://127.0.0.1:51000")
+    expect(client.session.active).toHaveBeenCalledTimes(4)
   })
 
   it("returns idle with the last assistant text and diff stats", async () => {
     seedRegistry([row()])
     const client = makeClient({
-      messages: vi.fn().mockResolvedValue({
-        data: [
-          {
-            info: { role: "user", id: "msg_prompt" },
-            parts: [{ type: "text", text: "go" }],
-          },
-          {
-            info: { role: "assistant", time: { completed: 1 } },
-            parts: [{ type: "text", text: "Created hello.txt" }],
-          },
-        ],
-      }),
-      diff: vi.fn().mockResolvedValue({
-        data: [
+      message: {
+        list: vi
+          .fn()
+          .mockResolvedValue(
+            history(
+              userMessage("go"),
+              assistantMessage({ text: "Created hello.txt" }),
+              idleMessage("succeeded"),
+            ),
+          ),
+      },
+      session: {
+        diff: vi.fn().mockResolvedValue([
           {
             file: "hello.txt",
             patch: "…",
@@ -392,10 +489,10 @@ describe("wait", () => {
             deletions: 0,
             status: "added",
           },
-        ],
-      }),
+        ]),
+      },
     })
-    mockCreateClient.mockReturnValue(client)
+    useClient(client)
 
     const result = JSON.parse(
       (await wait({ port: 51000, session_id: "ses_1" })).content[0].text,
@@ -408,28 +505,24 @@ describe("wait", () => {
         { file: "hello.txt", status: "added", additions: 1, deletions: 0 },
       ],
     })
-    expect(client.session.diff).toHaveBeenCalledWith({
-      sessionID: "ses_1",
-      directory: "/tmp/project",
-      messageID: "msg_prompt",
-    })
+    expect(client.session.diff).toHaveBeenCalledWith({ sessionID: "ses_1" })
   })
 
-  it("reports error when the last assistant message failed", async () => {
+  it("reports error when the run ended failed", async () => {
     seedRegistry([row()])
-    mockCreateClient.mockReturnValue(
+    useClient(
       makeClient({
-        messages: vi.fn().mockResolvedValue({
-          data: [
-            {
-              info: {
-                role: "assistant",
-                error: { name: "APIError", data: { message: "rate limited" } },
-              },
-              parts: [],
-            },
-          ],
-        }),
+        message: {
+          list: vi.fn().mockResolvedValue(
+            history(
+              userMessage("go"),
+              idleMessage("failed", {
+                type: "session.error",
+                message: "rate limited",
+              }),
+            ),
+          ),
+        },
       }),
     )
 
@@ -450,17 +543,19 @@ describe("reapInstances", () => {
       row({ port: 51002, pid: 5002, startedAt: old }),
       row({ port: 51003, pid: 5003, startedAt: old }),
     ])
-    mockCreateClient.mockImplementation(((opts: { baseUrl: string }) =>
+    mockMakeClient.mockImplementation(((opts: { baseUrl: string }) =>
       opts.baseUrl.endsWith(":51003")
         ? makeClient({
-            status: vi
-              .fn()
-              .mockResolvedValue({ data: { ses_busy: { type: "busy" } } }),
-            list: vi.fn().mockResolvedValue({
-              data: [{ id: "ses_busy", title: "t", time: { updated: 0 } }],
-            }),
+            session: {
+              active: vi
+                .fn()
+                .mockResolvedValue({ ses_busy: { type: "running" } }),
+              list: vi.fn().mockResolvedValue({
+                data: [{ id: "ses_busy", title: "t", time: { updated: 0 } }],
+              }),
+            },
           })
-        : makeClient()) as unknown as typeof createOpencodeClient)
+        : makeClient()) as unknown as typeof OpenCode.make)
 
     const reaped = await reapInstances()
 
@@ -475,11 +570,13 @@ describe("reapInstances", () => {
 
   it("keeps an idle instance whose last activity is within the TTL", async () => {
     seedRegistry([row({ port: 51004, pid: 5004 })])
-    mockCreateClient.mockReturnValue(
+    useClient(
       makeClient({
-        list: vi.fn().mockResolvedValue({
-          data: [{ id: "s", title: "t", time: { updated: Date.now() } }],
-        }),
+        session: {
+          list: vi.fn().mockResolvedValue({
+            data: [{ id: "s", title: "t", time: { updated: Date.now() } }],
+          }),
+        },
       }),
     )
     const reaped = await reapInstances(Date.now() + 30_000)
@@ -496,15 +593,17 @@ describe("stopInstance", () => {
     expect(killSpy).not.toHaveBeenCalledWith(expect.anything(), "SIGTERM")
   })
 
-  it("aborts busy sessions, terminates and deregisters", async () => {
+  it("interrupts busy sessions, terminates and deregisters", async () => {
     seedRegistry([row()])
     const client = makeClient({
-      list: vi.fn().mockResolvedValue({
-        data: [{ id: "ses_1", title: "t", time: { updated: 0 } }],
-      }),
-      status: vi.fn().mockResolvedValue({ data: { ses_1: { type: "busy" } } }),
+      session: {
+        list: vi.fn().mockResolvedValue({
+          data: [{ id: "ses_1", title: "t", time: { updated: 0 } }],
+        }),
+        active: vi.fn().mockResolvedValue({ ses_1: { type: "running" } }),
+      },
     })
-    mockCreateClient.mockReturnValue(client)
+    useClient(client)
 
     const result = JSON.parse(
       (await stopInstance({ port: 51000 })).content[0].text,
@@ -515,9 +614,8 @@ describe("stopInstance", () => {
       stopped: true,
       aborted_sessions: ["ses_1"],
     })
-    expect(client.session.abort).toHaveBeenCalledWith({
+    expect(client.session.interrupt).toHaveBeenCalledWith({
       sessionID: "ses_1",
-      directory: "/tmp/project",
     })
     expect(killSpy).toHaveBeenCalledWith(-LIVE_PID, "SIGTERM")
     expect(JSON.parse(readFileSync(registryPath, "utf8"))).toEqual([])
@@ -525,7 +623,7 @@ describe("stopInstance", () => {
 })
 
 describe("listInstances", () => {
-  it("shows the registered task sessions with their live status", async () => {
+  it("shows the registered task sessions with their live status, never the password", async () => {
     seedRegistry([
       row({
         sessions: [
@@ -533,17 +631,17 @@ describe("listInstances", () => {
         ],
       }),
     ])
-    mockCreateClient.mockReturnValue(
+    useClient(
       makeClient({
-        list: vi.fn().mockResolvedValue({
-          data: [
-            { id: "ses_1", title: "job", time: { updated: Date.now() } },
-            { id: "ses_other", title: "tui", time: { updated: Date.now() } },
-          ],
-        }),
-        status: vi
-          .fn()
-          .mockResolvedValue({ data: { ses_1: { type: "busy" } } }),
+        session: {
+          list: vi.fn().mockResolvedValue({
+            data: [
+              { id: "ses_1", title: "job", time: { updated: Date.now() } },
+              { id: "ses_other", title: "tui", time: { updated: Date.now() } },
+            ],
+          }),
+          active: vi.fn().mockResolvedValue({ ses_1: { type: "running" } }),
+        },
       }),
     )
 
@@ -552,5 +650,6 @@ describe("listInstances", () => {
     expect(instance.sessions).toEqual([
       expect.objectContaining({ id: "ses_1", status: "busy" }),
     ])
+    expect(instance.password).toBeUndefined()
   })
 })

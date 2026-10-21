@@ -74,10 +74,10 @@ export const missingSrtError = () =>
 
 // ─── srt settings ───
 
-// Network allowlist. Verified against the strings of the installed
-// opencode 1.18.34 binary: opencode.ai (+ api./models. subdomains via
-// the wildcard) serves the Zen API behind the free "opencode/*"
-// models, models.dev is the model registry, and api.githubcopilot.com
+// Network allowlist. Verified against the strings of the opencode 2.1.2
+// binary: opencode.ai serves the Zen API behind the free "opencode/*"
+// models, models.opencode.ai (via the wildcard) is the model registry,
+// models.dev is kept for older registry lookups, and api.githubcopilot.com
 // serves the default github-copilot/* models. github.com,
 // api.github.com and registry.npmjs.org are assumed useful (public
 // clones, npm installs); localhost/loopback plus allowLocalBinding
@@ -154,6 +154,14 @@ export const resolveOpencodeDirs = (
     : join(home, ".local", "state", "opencode"),
 })
 
+// opencode v2 keeps the background service's password in these files.
+// A headless instance never needs them, and reading them would let it drive
+// the user's own, unguarded service.
+export const serviceCredentialFiles = (opencode: OpencodeDirs) => [
+  join(opencode.config, "service.json"),
+  join(opencode.state, "service.json"),
+]
+
 const defaultGitRun = (directory: string, flag: string) =>
   execSync("git rev-parse " + flag, {
     cwd: directory,
@@ -219,7 +227,7 @@ export const buildSrtSettings = ({
       allowLocalBinding: true,
     },
     filesystem: {
-      denyRead: [...SRT_DENY_READ],
+      denyRead: [...SRT_DENY_READ, ...serviceCredentialFiles(opencode)],
       allowRead: [],
       allowWrite,
       denyWrite: [],
@@ -246,27 +254,27 @@ export const tmpdirsForSandbox = (
 
 // ─── Layer 2: opencode permission extras ───
 
-// Extra bash denies applied only when sandboxed, appended after the
-// base ruleset's bash allow (opencode applies the last matching rule).
+// Extra shell denies applied only when sandboxed, appended after the
+// base ruleset's shell allow (opencode applies the last matching rule).
 // deny, never ask: headless cannot answer and would hang. These are
 // heuristic glob matches (* spans any characters), defence in depth
 // behind the OS sandbox, not a guarantee.
-export const SANDBOX_BASH_DENY_PATTERNS = [
+export const SANDBOX_SHELL_DENY_PATTERNS = [
   "rm -rf*",
   "sudo *",
   "curl *|*",
   "wget *|*",
 ]
 
-export type BashDenyEntry = {
-  permission: "bash"
-  pattern: string
-  action: "deny"
+export type ShellDenyRule = {
+  action: "shell"
+  resource: string
+  effect: "deny"
 }
 
-export const sandboxBashDenyEntries = (): BashDenyEntry[] =>
-  SANDBOX_BASH_DENY_PATTERNS.map((pattern) => ({
-    permission: "bash" as const,
-    pattern,
-    action: "deny" as const,
+export const sandboxShellDenyRules = (): ShellDenyRule[] =>
+  SANDBOX_SHELL_DENY_PATTERNS.map((resource) => ({
+    action: "shell" as const,
+    resource,
+    effect: "deny" as const,
   }))
