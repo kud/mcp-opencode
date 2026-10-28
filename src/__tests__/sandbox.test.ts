@@ -265,6 +265,7 @@ describe("buildSrtSettings", () => {
         "*.opencode.ai",
         "models.dev",
         "api.githubcopilot.com",
+        "openrouter.ai",
         "github.com",
         "api.github.com",
         "registry.npmjs.org",

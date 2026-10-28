@@ -11,8 +11,7 @@ export const SANDBOX_ENV_VAR = "MCP_OPENCODE_SANDBOX"
 export const SANDBOX_SETTINGS_ENV_VAR = "MCP_OPENCODE_SANDBOX_SETTINGS"
 export const SUPPORTED_SANDBOXES = ["srt"] as const
 export type SandboxKind = (typeof SUPPORTED_SANDBOXES)[number]
-export const SRT_INSTALL_HINT =
-  "npm i -g @anthropic-ai/sandbox-runtime"
+export const SRT_INSTALL_HINT = "npm i -g @anthropic-ai/sandbox-runtime"
 
 export type SandboxRequest = {
   kind: SandboxKind
@@ -77,10 +76,10 @@ export const missingSrtError = () =>
 // Network allowlist. Verified against the strings of the opencode 2.1.2
 // binary: opencode.ai serves the Zen API behind the free "opencode/*"
 // models, models.opencode.ai (via the wildcard) is the model registry,
-// models.dev is kept for older registry lookups, and api.githubcopilot.com
-// serves the default github-copilot/* models. github.com,
-// api.github.com and registry.npmjs.org are assumed useful (public
-// clones, npm installs); localhost/loopback plus allowLocalBinding
+// models.dev is kept for older registry lookups, api.githubcopilot.com
+// serves the default github-copilot/* models and openrouter.ai the
+// openrouter/* models. github.com, api.github.com and registry.npmjs.org
+// are assumed useful (public clones, npm installs); localhost/loopback plus allowLocalBinding
 // let the instance serve on 127.0.0.1. Everything else stays denied:
 // srt is deny-all by default.
 export const SRT_NETWORK_ALLOWED_DOMAINS = [
@@ -88,6 +87,7 @@ export const SRT_NETWORK_ALLOWED_DOMAINS = [
   "*.opencode.ai",
   "models.dev",
   "api.githubcopilot.com",
+  "openrouter.ai",
   "github.com",
   "*.github.com",
   "api.github.com",
