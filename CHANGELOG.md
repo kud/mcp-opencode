@@ -4,6 +4,14 @@ All notable changes to this project are documented here.
 
 ---
 
+## 2.1.0 — 2026-10-28
+
+### Highlights
+
+- Sandboxed instances can now reach `openrouter.ai`, so `openrouter/*` models work under `MCP_OPENCODE_SANDBOX=srt`. The README's allowed-network list is updated to match. ([a579edd](https://github.com/kud/mcp-opencode/commit/a579edd0c182e73c74bc19252150dc906898b6dd))
+
+---
+
 ## 2.0.0 — 2026-10-21
 
 ### Breaking Changes
