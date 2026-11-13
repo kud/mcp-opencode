@@ -42,7 +42,7 @@
   "bugs": {
     "url": "https://github.com/kud/mcp-opencode/issues"
   },
-  "homepage": "https://github.com/kud/mcp-opencode#readme",
+  "homepage": "https://kud.io/projects/mcp-opencode",
   "engines": {
     "node": ">=20.0.0"
   },
